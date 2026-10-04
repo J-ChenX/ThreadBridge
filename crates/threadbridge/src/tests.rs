@@ -36,6 +36,104 @@ fn submit(s: &Snapshot) -> Submit {
     }
 }
 #[test]
+fn visible_message_state_survives_replay_reopen_and_same_timestamp_updates() {
+    let (dir, db, host, _phone, mut s) = setup();
+    let completed_revision = s.thread.revision.clone();
+    let activity = s.thread.updated_at * 1000 + 123;
+    s.messages = vec![ChatMessage {
+        id: "live-z".into(),
+        turn_id: "running".into(),
+        role: "assistant".into(),
+        text: "working".into(),
+        version: hash("working"),
+        ordinal: activity,
+    }];
+    db.snapshot(&host, &s).unwrap();
+    let first = db.threads(0).unwrap()["threads"][0].clone();
+    assert_eq!(first["message_revision"], 1);
+    assert_eq!(first["message_activity_at"], activity);
+    db.snapshot(&host, &s).unwrap();
+    assert_eq!(db.threads(0).unwrap()["threads"][0]["message_revision"], 1);
+    s.thread.title = "renamed".into();
+    s.messages.clear();
+    db.snapshot(&host, &s).unwrap();
+    assert_eq!(db.threads(0).unwrap()["threads"][0]["message_revision"], 1);
+    // A second message shares the timestamp and sorts before the first ID.
+    s.messages = vec![ChatMessage {
+        id: "live-a".into(),
+        turn_id: "running".into(),
+        role: "user".into(),
+        text: "more".into(),
+        version: hash("more"),
+        ordinal: activity,
+    }];
+    db.snapshot(&host, &s).unwrap();
+    let reopened = Store::open(&dir.path().join("db.sqlite")).unwrap();
+    let next = reopened.threads(0).unwrap()["threads"][0].clone();
+    assert_eq!(next["revision"], completed_revision);
+    assert_eq!(next["updated_at"], first["updated_at"]);
+    assert_eq!(next["message_revision"], 2);
+    s.messages[0].text = "changed".into();
+    s.messages[0].version = hash("changed");
+    reopened.snapshot(&host, &s).unwrap();
+    assert_eq!(
+        reopened.threads(0).unwrap()["threads"][0]["message_revision"],
+        3
+    );
+    reopened
+        .delete_source(&host, &s.thread.native_id, Some("live-a"))
+        .unwrap();
+    assert_eq!(
+        reopened.threads(0).unwrap()["threads"][0]["message_revision"],
+        4
+    );
+    reopened.delete_copy(&s.thread.id).unwrap();
+    assert_eq!(
+        reopened
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM thread_message_state", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn existing_hub_messages_seed_activity_without_invalidating_read_baselines() {
+    let (dir, db, host, _phone, mut s) = setup();
+    let activity = s.thread.updated_at * 1000 + 456;
+    s.messages = vec![ChatMessage {
+        id: "old".into(),
+        turn_id: "turn-1".into(),
+        role: "assistant".into(),
+        text: "old reply".into(),
+        version: hash("old reply"),
+        ordinal: activity,
+    }];
+    db.snapshot(&host, &s).unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute("DROP TABLE thread_message_state", [])
+        .unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM settings WHERE k='message_state_initialized'",
+            [],
+        )
+        .unwrap();
+    let upgraded = Store::open(&dir.path().join("db.sqlite")).unwrap();
+    let row = upgraded.threads(0).unwrap()["threads"][0].clone();
+    assert_eq!(row["message_revision"], 0);
+    assert_eq!(row["message_activity_at"], activity);
+    upgraded.snapshot(&host, &s).unwrap();
+    assert_eq!(
+        upgraded.threads(0).unwrap()["threads"][0]["message_revision"],
+        0
+    );
+}
+#[test]
 fn same_id_is_deduplicated_and_different_content_rejected() {
     let (_d, db, _h, p, s) = setup();
     let mut req = submit(&s);

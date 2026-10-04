@@ -31,6 +31,9 @@ def mock():
    assert params['threadId']==NATIVE and params['approvalPolicy']=='on-request' and params['approvalsReviewer']=='user' and params['sandboxPolicy']=={'type':'readOnly','networkAccess':False}
    assert params['input']==[{'type':'text','text':'synthetic explicit phone action'}]
    emit({'id':row['id'],'result':{'turn':{'id':TURN,'status':'inProgress'}}})
+   if (root/'pause-final').exists():
+    (root/'turn-running').write_text('1')
+    while not (root/'allow-final').exists():time.sleep(.005)
    emit({'method':'item/completed','params':{'threadId':NATIVE,'turnId':TURN,'item':{'type':'agentMessage','phase':'final_answer','text':'synthetic final'}}})
    emit({'method':'turn/completed','params':{'threadId':NATIVE,'turn':{'id':TURN,'status':'completed'}}});continue
   else:raise AssertionError(method)
@@ -89,13 +92,25 @@ def main():
      time.sleep(.02)
     subprocess.run([binary,'capture-import','--db',db,'--capture-db',capture_db,'--host',HOST,'--thread',NATIVE],env=env,check=True,stdout=subprocess.DEVNULL)
     assert next(r for r in api('/v1/threads')['threads'] if r['native_id']==NATIVE)['status']=='resume_ready'
+    (root/'pause-final').write_text('1')
+    # Let the initial idle wait register the process signal receiver.
+    time.sleep(.05)
    command=api('/v1/commands',{'request_id':str(uuid.uuid4()),'thread_id':chosen['id'],'text':'synthetic explicit phone action','expected_revision':chosen['revision'],'created_at':int(time.time()),'kind':'send'})
    if is_worker:
     deadline=time.monotonic()+7
+    while not (root/'turn-running').exists():
+     if worker.poll() is not None or time.monotonic()>deadline:raise AssertionError('Mock turn did not start')
+     time.sleep(.01)
+    # Signal while dispatch awaits the mock final. Finish that turn before
+    # releasing ownership; a signal receiver recreated later loses this signal.
+    worker.send_signal(signal.SIGINT);time.sleep(.05)
+    assert worker.poll() is None,'Worker must finish the in-flight turn before shutdown'
+    (root/'allow-final').write_text('1')
+    deadline=time.monotonic()+7
     while api('/v1/commands/'+command['id'])['status']!='codex_accepted':
-     if worker.poll() is not None or time.monotonic()>deadline:raise AssertionError('Rust worker did not complete')
+     if time.monotonic()>deadline:raise AssertionError('Rust worker did not complete')
      time.sleep(.02)
-    stop_worker();assert worker.returncode==0
+    worker.wait(timeout=5);assert worker.returncode==0
     with closing(sqlite3.connect(db)) as c,c:
      assert c.execute('SELECT can_send,status FROM threads WHERE id=?',(chosen['id'],)).fetchone()==(0,'capture_only')
      assert c.execute('SELECT last_seen FROM resume_owners WHERE thread=?',(chosen['id'],)).fetchone()[0]==0
@@ -122,6 +137,7 @@ def main():
     else:raise AssertionError('expired resume lease accepted a message')
    print('PASS: Rust resume CLI preserves same-title original ID, unmodified input, one authoritative turn, final capture, duplicate no resend, worker lease and release, and task isolation')
   finally:
+   (root/'allow-final').write_text('1')
    stop_worker()
    if worker is not None and worker.stderr is not None:worker.stderr.close()
    process.terminate();process.wait(timeout=3)

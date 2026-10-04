@@ -65,10 +65,18 @@ fn import_title(
         [key(host, native)],
         |r| r.get(0),
     )?;
-    let (latest_turn, updated): (String, i64) = source.query_row(
-        "SELECT turn_id,captured_at FROM captured_replies WHERE thread_id=?1 ORDER BY rowid DESC LIMIT 1",
-        [native], |r| Ok((r.get(0)?, r.get(1)?)),
+    let has_order: bool = source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_turn_order'",
+        [],
+        |r| r.get(0),
     )?;
+    let latest_sql = if has_order {
+        "SELECT r.turn_id,coalesce(o.completed_at/1000,r.captured_at) FROM captured_replies r LEFT JOIN captured_turn_order o ON o.thread_id=r.thread_id AND o.turn_id=r.turn_id WHERE r.thread_id=?1 ORDER BY coalesce(o.completed_at,r.captured_at*1000) DESC,r.rowid DESC LIMIT 1"
+    } else {
+        "SELECT turn_id,captured_at FROM captured_replies WHERE thread_id=?1 ORDER BY rowid DESC LIMIT 1"
+    };
+    let (latest_turn, updated): (String, i64) =
+        source.query_row(latest_sql, [native], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let has_title: bool = {
         let mut q = source.prepare("PRAGMA table_info(captured_replies)")?;
         let names = q
@@ -208,7 +216,14 @@ fn import_title(
         }
         use rusqlite::OptionalExtension;
         let row_id: i64 = row.get(5)?;
-        let prior:Option<String>=source.query_row("SELECT turn_id FROM captured_replies WHERE thread_id=?1 AND rowid<?2 ORDER BY rowid DESC LIMIT 1",rusqlite::params![native,row_id],|r|r.get(0)).optional()?;
+        let prior_sql = if has_order {
+            "SELECT r.turn_id FROM captured_replies r LEFT JOIN captured_turn_order o ON o.thread_id=r.thread_id AND o.turn_id=r.turn_id WHERE r.thread_id=?1 AND (coalesce(o.completed_at,r.captured_at*1000),r.rowid)<(SELECT coalesce(c.completed_at,v.captured_at*1000),v.rowid FROM captured_replies v LEFT JOIN captured_turn_order c ON c.thread_id=v.thread_id AND c.turn_id=v.turn_id WHERE v.rowid=?2) ORDER BY coalesce(o.completed_at,r.captured_at*1000) DESC,r.rowid DESC LIMIT 1"
+        } else {
+            "SELECT turn_id FROM captured_replies WHERE thread_id=?1 AND rowid<?2 ORDER BY rowid DESC LIMIT 1"
+        };
+        let prior: Option<String> = source
+            .query_row(prior_sql, rusqlite::params![native, row_id], |r| r.get(0))
+            .optional()?;
         let mut eligible = Vec::new();
         if requests.len() <= 16 {
             let c = db.0.lock().unwrap();
@@ -323,7 +338,65 @@ fn import_title(
             db.0.lock().unwrap().execute("INSERT INTO capture_user_import_positions(thread,last_row) VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET last_row=excluded.last_row",rusqlite::params![projection.id,row_id])?;
         }
     }
+    if source.query_row("SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_visible_messages'",[],|r|r.get::<_,bool>(0))? {
+        let position: i64 = db.0.lock().unwrap().query_row("SELECT coalesce((SELECT last_row FROM capture_visible_import_positions WHERE thread=?1),0)",[&projection.id],|r|r.get(0))?;
+        let mut q = source.prepare("SELECT rowid,turn_id,message_id,text,created_at FROM captured_visible_messages WHERE thread_id=?1 AND rowid>?2 ORDER BY rowid")?;
+        for row in q.query_map(rusqlite::params![native,position],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))? {
+            let (row,turn,id,text,ordinal)=row?;
+            uuid::Uuid::parse_str(&turn)?;
+            anyhow::ensure!(!text.is_empty() && text.len()<=256*1024 && id.len()<=128,"invalid_visible_message");
+            db.capture_snapshot(host,&Snapshot {thread:projection.clone(),messages:vec![ChatMessage{id:format!("native:{id}"),turn_id:turn,role:"assistant".into(),version:hash(&text),text,ordinal}],initial:true,history:false},&title)?;
+            db.0.lock().unwrap().execute("INSERT INTO capture_visible_import_positions VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET last_row=excluded.last_row",rusqlite::params![projection.id,row])?;
+        }
+    }
+    if source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_images'",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        let mut q = source
+            .prepare("SELECT message_id,image_id,mime FROM captured_images WHERE thread_id=?1")?;
+        for row in q.query_map([native], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })? {
+            let (message, image, mime) = row?;
+            let hub_message = format!("input:{message}");
+            let c = db.0.lock().unwrap();
+            if c.query_row(
+                "SELECT count(*)>0 FROM attachments WHERE thread=?1 AND message=?2 AND image=?3",
+                rusqlite::params![projection.id, hub_message, image],
+                |r| r.get::<_, bool>(0),
+            )? {
+                continue;
+            }
+            let bytes:Vec<u8>=source.query_row("SELECT bytes FROM captured_images WHERE thread_id=?1 AND message_id=?2 AND image_id=?3",rusqlite::params![native,message,image],|r|r.get(0))?;
+            let used: i64 = c.query_row(
+                "SELECT coalesce(sum(length(bytes)),0) FROM attachments",
+                [],
+                |r| r.get(0),
+            )?;
+            anyhow::ensure!(
+                used + bytes.len() as i64 <= 64 * 1024 * 1024,
+                "image_storage_budget"
+            );
+            anyhow::ensure!(
+                image == hash_bytes(&bytes)
+                    && bytes.len() <= 2 * 1024 * 1024
+                    && ["image/png", "image/jpeg", "image/webp"].contains(&mime.as_str()),
+                "invalid_image"
+            );
+            c.execute("INSERT OR IGNORE INTO attachments SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(SELECT 1 FROM messages WHERE thread=?1 AND id=?2) AND NOT EXISTS(SELECT 1 FROM tombstones WHERE thread=?1 AND (message='' OR message=?2))",rusqlite::params![projection.id,format!("input:{message}"),image,mime,bytes])?;
+        }
+    }
     Ok(imported)
+}
+fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Independent read projection: no Codex process, CLI, model, or send permission.
@@ -333,6 +406,7 @@ pub async fn sync_catalog(
     host: String,
     catalog: Option<std::path::PathBuf>,
     all_captured: bool,
+    native_index: Option<std::path::PathBuf>,
 ) -> Result<()> {
     use std::io::Read;
     anyhow::ensure!(
@@ -362,6 +436,7 @@ pub async fn sync_catalog(
         |r| r.get(0),
     )?;
     anyhow::ensure!(valid, "capture_requires_existing_authorized_host");
+    let mut fingerprints = std::collections::BTreeMap::new();
     loop {
         let selected = if all_captured {
             let read = || -> Result<std::collections::BTreeMap<String, String>> {
@@ -405,6 +480,27 @@ pub async fn sync_catalog(
             }
         }
         for (native, title) in &selected {
+            if let Some(index) = &native_index {
+                let refresh = (|| -> Result<()> {
+                    let c = crate::collection::readonly(index)?;
+                    let path: String = c.query_row(
+                        "SELECT rollout_path FROM threads WHERE id=?1",
+                        [native],
+                        |r| r.get(0),
+                    )?;
+                    let fingerprint = crate::native_remote::fingerprint(Path::new(&path))?;
+                    if fingerprints.get(native) != Some(&fingerprint) {
+                        crate::visible_history::backfill(&source, index, native)?;
+                        fingerprints.insert(native.clone(), fingerprint);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = refresh {
+                    health["projection_error"] =
+                        serde_json::json!("visible_history_projection_failed");
+                    eprintln!("Visible history unavailable for {}: {error}", &native[..8]);
+                }
+            }
             let hint = if title.is_empty() {
                 None
             } else {
@@ -420,7 +516,7 @@ pub async fn sync_catalog(
     }
 }
 
-fn save_health(db: &Store, host: &str, status: serde_json::Value) -> Result<()> {
+pub(crate) fn save_health(db: &Store, host: &str, status: serde_json::Value) -> Result<()> {
     db.0.lock().unwrap().execute("INSERT INTO capture_health(host,status,checked_at) VALUES(?1,?2,?3) ON CONFLICT(host) DO UPDATE SET status=excluded.status,checked_at=excluded.checked_at",rusqlite::params![host,status.to_string(),now()])?;
     Ok(())
 }

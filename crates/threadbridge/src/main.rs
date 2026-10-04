@@ -16,9 +16,11 @@ mod notify;
 #[cfg(unix)]
 mod probe;
 mod queue;
+mod replica_cleanup;
 mod store;
 #[cfg(test)]
 mod tests;
+mod visible_history;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -44,6 +46,10 @@ enum Commands {
     RecoverCaptureHealth(native_recovery::RecoveryArgs),
     /// Inspect a complete collection baseline; --apply explicitly resets replicas.
     CollectionReset(collection_reset::ResetArgs),
+    /// Remove internal subagent replicas and their capture failures; preserve native Codex.
+    CleanupSubagents(replica_cleanup::CleanupArgs),
+    /// Remove archived replicas by native metadata, without merging equal titles.
+    CleanupArchived(replica_cleanup::CleanupArgs),
     /// Explicit grant and execute-gated original-ID resume candidate.
     Resume(native_resume::ResumeArgs),
     /// Persist a completed notify event using an explicit collection scope.
@@ -68,6 +74,18 @@ enum Commands {
         catalog: Option<PathBuf>,
         #[arg(long)]
         all_captured: bool,
+        /// Read user text/images and visible assistant messages from this native index.
+        #[arg(long)]
+        native_index: Option<PathBuf>,
+    },
+    /// Read-only native history reconciliation; writes only the configured replica.
+    CaptureBackfill {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        thread: String,
     },
     CaptureBridge {
         #[arg(long)]
@@ -329,6 +347,12 @@ async fn main() -> Result<()> {
         Commands::RemoteCapture(args) => native_remote::run(args).await?,
         Commands::RecoverCaptureHealth(args) => native_recovery::run(args).await?,
         Commands::CollectionReset(args) => collection_reset::run(args).await?,
+        Commands::CleanupSubagents(args) => {
+            replica_cleanup::run(args, replica_cleanup::Kind::Subagent)?
+        }
+        Commands::CleanupArchived(args) => {
+            replica_cleanup::run(args, replica_cleanup::Kind::Archived)?
+        }
         Commands::Resume(args) => native_resume::run(args).await?,
         Commands::Capture(args) => match native_capture::capture(&args.payload, &args.options()) {
             Ok(result) => println!("{result}"),
@@ -344,11 +368,24 @@ async fn main() -> Result<()> {
             host,
             catalog,
             all_captured,
+            native_index,
         } => {
             anyhow::ensure!(db.is_file(), "existing Hub database required");
-            capture::sync_catalog(Store::open(&db)?, capture_db, host, catalog, all_captured)
-                .await?;
+            capture::sync_catalog(
+                Store::open(&db)?,
+                capture_db,
+                host,
+                catalog,
+                all_captured,
+                native_index,
+            )
+            .await?;
         }
+        Commands::CaptureBackfill {
+            database,
+            index,
+            thread,
+        } => println!("{}", visible_history::backfill(&database, &index, &thread)?),
         Commands::CaptureBridge {
             db,
             capture_db,

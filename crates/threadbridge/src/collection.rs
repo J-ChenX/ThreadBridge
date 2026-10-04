@@ -16,6 +16,8 @@ pub const CAPTURE_TABLES: &[&str] = &[
     "captured_request_candidates",
     "captured_user_messages",
     "captured_turn_order",
+    "captured_visible_messages",
+    "captured_images",
 ];
 pub const HUB_TABLES: &[&str] = &[
     "threads",
@@ -28,6 +30,9 @@ pub const HUB_TABLES: &[&str] = &[
     "capture_health",
     "capture_import_positions",
     "capture_user_import_positions",
+    "capture_visible_import_positions",
+    "attachments",
+    "thread_message_state",
     "resume_owners",
 ];
 pub fn suffix(path: &Path, extra: &str) -> PathBuf {
@@ -189,8 +194,69 @@ pub fn baseline(index: &Path, generation: &str) -> Result<Value> {
     tx.commit()?;
     Ok(policy)
 }
+/// The native index includes internal agent threads that are not user conversations.
+/// Support both recent thread_source metadata and the older serialized source field.
+pub fn is_subagent(index: &Connection, native: &str) -> Result<bool> {
+    let columns = index
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let kind = if columns.contains("thread_source") {
+        "thread_source"
+    } else {
+        "NULL"
+    };
+    let source = if columns.contains("source") {
+        "source"
+    } else {
+        "NULL"
+    };
+    let row: Option<(Option<String>, Option<String>)> = index
+        .query_row(
+            &format!("SELECT {kind},{source} FROM threads WHERE id=?1"),
+            [native],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((kind, source)) = row else {
+        return Ok(false);
+    };
+    Ok(kind.as_deref() == Some("subagent")
+        || source.is_some_and(|source| {
+            source == "subagent"
+                || serde_json::from_str::<Value>(&source).is_ok_and(|value| {
+                    value.get("subagent").is_some() || value.as_str() == Some("subagent")
+                })
+        }))
+}
+pub fn is_archived(index: &Connection, native: &str) -> Result<bool> {
+    let columns = index
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    if !columns.contains("archived") {
+        return Ok(false);
+    }
+    Ok(index
+        .query_row(
+            "SELECT archived=1 FROM threads WHERE id=?1",
+            [native],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
 pub fn allowed(database: &Path, index: Option<&Path>, native: &str) -> Result<bool> {
-    let Some(policy) = read_policy(database)? else {
+    let policy = read_policy(database)?;
+    // Filter even when collection has no cutoff yet. Explicit native metadata is
+    // authoritative; agent_created_thread remains an ordinary named conversation.
+    let source = index.map(readonly).transpose()?;
+    if let Some(source) = &source {
+        if is_subagent(source, native)? || is_archived(source, native)? {
+            return Ok(false);
+        }
+    }
+    let Some(policy) = policy else {
         return Ok(true);
     };
     if policy["enabled"].as_bool() == Some(false)
@@ -202,7 +268,7 @@ pub fn allowed(database: &Path, index: Option<&Path>, native: &str) -> Result<bo
     {
         return Ok(false);
     }
-    let db = readonly(index.ok_or_else(|| anyhow::anyhow!("collection_index_required"))?)?;
+    let db = source.ok_or_else(|| anyhow::anyhow!("collection_index_required"))?;
     let mut query = db.prepare("PRAGMA table_info(threads)")?;
     let ms = query
         .query_map([], |r| r.get::<_, String>(1))?
@@ -251,6 +317,7 @@ pub fn purge(database: &Path, natives: &[String]) -> Result<()> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     db.busy_timeout(Duration::from_secs(3))?;
+    db.pragma_update(None, "secure_delete", true)?;
     let tx = db.transaction()?;
     let tables = tables(&tx)?;
     for table in CAPTURE_TABLES {
@@ -382,6 +449,52 @@ mod tests {
             )
             .unwrap();
         assert!(allowed(&db, Some(&index), &new).unwrap());
+    }
+    #[test]
+    fn subagents_are_excluded_with_or_without_a_collection_cutoff() {
+        let (_d, index, db, _, p) = fixture();
+        let c = Connection::open(&index).unwrap();
+        c.execute_batch("ALTER TABLE threads ADD COLUMN thread_source TEXT; ALTER TABLE threads ADD COLUMN source TEXT").unwrap();
+        let cutoff = p["cutoff_ms"].as_i64().unwrap() + 1;
+        for (kind, source, expected) in [
+            ("subagent", "{}", false),
+            (
+                "user",
+                r#"{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}"#,
+                false,
+            ),
+            ("user", "subagent", false),
+            ("user", "cli", true),
+            ("agent_created_thread", "appServer", true),
+        ] {
+            let native = uuid::Uuid::new_v4().to_string();
+            c.execute(
+                "INSERT INTO threads VALUES(?1,1,?2,?3,?4)",
+                rusqlite::params![native, cutoff, kind, source],
+            )
+            .unwrap();
+            assert_eq!(allowed(&db, Some(&index), &native).unwrap(), expected);
+            let no_policy = db.with_file_name("unmanaged.sqlite");
+            assert_eq!(
+                allowed(&no_policy, Some(&index), &native).unwrap(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn archive_filter_uses_identity_metadata_and_preserves_active_same_title_threads() {
+        let (_d, index, db, _, p) = fixture();
+        let c = Connection::open(&index).unwrap();
+        c.execute_batch("ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0; ALTER TABLE threads ADD COLUMN title TEXT").unwrap();
+        for archived in [0, 0, 1] {
+            let native = uuid::Uuid::new_v4().to_string();
+            c.execute(
+                "INSERT INTO threads VALUES(?1,1,?2,?3,'same name')",
+                rusqlite::params![native, p["cutoff_ms"].as_i64().unwrap() + 1, archived],
+            )
+            .unwrap();
+            assert_eq!(allowed(&db, Some(&index), &native).unwrap(), archived == 0);
+        }
     }
     #[test]
     fn missing_corrupt_or_disabled_policy_fails_closed() {

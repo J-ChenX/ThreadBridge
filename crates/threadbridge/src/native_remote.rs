@@ -763,6 +763,25 @@ mod tests {
         assert!(!body.contains("过程"));
     }
     #[test]
+    fn poll_skips_subagents_before_reading_their_rollout_or_reporting_failure() {
+        let f = Fixture::new();
+        let c = Connection::open(&f.index).unwrap();
+        c.execute_batch("ALTER TABLE threads ADD COLUMN source TEXT")
+            .unwrap();
+        c.execute(
+            "UPDATE threads SET source=?1",
+            [r#"{"subagent":{"thread_spawn":{}}}"#],
+        )
+        .unwrap();
+        fs::remove_file(&f.path).unwrap();
+        f.capture();
+        assert_eq!(f.count(), 0);
+        assert!(health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
     fn session_root_and_identity_checked() {
         let mut f = Fixture::new();
         f.append("human");

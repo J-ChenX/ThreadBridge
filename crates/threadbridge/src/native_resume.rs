@@ -759,6 +759,10 @@ async fn worker_inner(
     let digest = grant_hash(grant)?;
     let _lock = owner_lock(database, &thread)?;
     let mut c = connect(database)?;
+    // Keep the registered signal receiver alive while dispatch is in progress.
+    // Recreating it after every sleep can lose SIGINT between polling waits.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
     let outcome=async {
         reconcile_completed(database,capture_db,grant)?;let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(tx.query_row("SELECT count(*) FROM devices WHERE id=? AND role='agent' AND revoked=0 AND expires>?",params![grant.host_id,now()],|r|r.get::<_,i64>(0))?>0,"host_not_authorized");
@@ -785,7 +789,7 @@ async fn worker_inner(
             let pending:Option<String>=c.query_row("SELECT id FROM commands WHERE thread=? AND status='accepted' AND expires>? ORDER BY created LIMIT 1",params![thread,now()],|r|r.get(0)).optional()?;
             if let Some(command)=pending{dispatch(database,capture_db,codex,grant,&command,true,Duration::from_secs((grant.expires_at-now()).clamp(1,900) as u64),Duration::from_secs(10)).await?;}
             iterations+=1;if stop_after.is_some_and(|n|iterations>=n){return Ok(())}
-            tokio::select!{_=tokio::time::sleep(poll)=>{},_=tokio::signal::ctrl_c()=>{return Ok(())}}
+            tokio::select!{_=tokio::time::sleep(poll)=>{},_=&mut shutdown=>{return Ok(())}}
         }
     }.await;
     let cleanup = (|| -> Result<()> {

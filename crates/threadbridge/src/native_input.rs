@@ -1,6 +1,7 @@
 //! Opt-in, bounded capture of human text from the explicitly completed native turn.
 //! Notify input-messages may contain history or system context and are never input sources.
 use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +18,145 @@ pub struct UserMessage {
     pub text: String,
     pub created_at: i64,
     pub input_digest: String,
+    #[serde(default)]
+    pub images: Vec<UserImage>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserImage {
+    pub id: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+pub fn parse_user(payload: &Value) -> Result<Option<UserMessage>> {
+    if payload["type"] != "message" || payload["role"] != "user" {
+        return Ok(None);
+    }
+    let meta = &payload["internal_chat_message_metadata_passthrough"];
+    let Some(kinds) = meta["content_item_kinds"].as_array() else {
+        return Ok(None);
+    };
+    if kinds.is_empty()
+        || kinds
+            .iter()
+            .any(|k| ![Some("user.text"), Some("user.image")].contains(&k.as_str()))
+    {
+        return Ok(None);
+    }
+    let Some(content) = payload["content"].as_array() else {
+        return Ok(None);
+    };
+    let has_images = kinds.iter().any(|k| k == "user.image");
+    if content.is_empty()
+        || content
+            .iter()
+            .any(|x| ![Some("input_text"), Some("input_image")].contains(&x["type"].as_str()))
+    {
+        return Ok(None);
+    }
+    if has_images {
+        if kinds.len() != content.len()
+            || kinds.iter().zip(content).any(|(kind, item)| {
+                (kind == "user.text" && item["type"] != "input_text")
+                    || (kind == "user.image" && item["type"] != "input_image")
+            })
+        {
+            return Ok(None);
+        }
+    } else if content.iter().any(|x| x["type"] != "input_text") {
+        return Ok(None);
+    }
+    let mut raw = String::new();
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for item in content {
+        if item["type"] == "input_text" {
+            let value = item["text"]
+                .as_str()
+                .context("user_turn_metadata_invalid")?;
+            raw.push_str(value);
+            let value = if has_images
+                && value
+                    .trim_start()
+                    .starts_with("# Files mentioned by the user:")
+            {
+                value
+                    .split_once("## My request:\n")
+                    .map(|(_, request)| request)
+                    .unwrap_or(value)
+            } else {
+                value
+            };
+            let trimmed = value.trim();
+            if has_images
+                && ((trimmed.starts_with("<image ") && trimmed.ends_with('>'))
+                    || trimmed == "</image>")
+            {
+                continue;
+            }
+            text.push_str(value);
+        } else {
+            let url = item["image_url"]
+                .as_str()
+                .context("user_image_unavailable")?;
+            let (header, encoded) = url.split_once(',').context("user_image_unavailable")?;
+            let mime = match header {
+                "data:image/jpeg;base64" => "image/jpeg",
+                "data:image/png;base64" => "image/png",
+                "data:image/webp;base64" => "image/webp",
+                _ => bail!("user_image_format_unsupported"),
+            };
+            ensure!(encoded.len() <= 3 * 1024 * 1024, "user_image_limit");
+            let bytes = STANDARD.decode(encoded).context("user_image_invalid")?;
+            ensure!(
+                !bytes.is_empty() && bytes.len() <= 2 * 1024 * 1024 && images.len() < 16,
+                "user_image_limit"
+            );
+            let id = format!("{:x}", Sha256::digest(&bytes));
+            if !images.iter().any(|image: &UserImage| image.id == id) {
+                images.push(UserImage {
+                    id: id.clone(),
+                    mime: mime.into(),
+                    bytes,
+                });
+            }
+            text.push_str(&format!("\n![图片](threadbridge-image:{id})\n"));
+        }
+    }
+    ensure!(
+        !text.trim().is_empty() && text.len() <= MAX_INPUT && raw.len() <= MAX_INPUT,
+        "user_turn_input_limit"
+    );
+    let message_id = payload["id"]
+        .as_str()
+        .context("user_turn_metadata_invalid")?;
+    let created = meta["create_time"]
+        .as_f64()
+        .context("user_turn_metadata_invalid")?;
+    ensure!(
+        !message_id.is_empty()
+            && message_id.chars().count() <= 128
+            && created.is_finite()
+            && (created * 1000.0).abs() <= i64::MAX as f64,
+        "user_turn_metadata_invalid"
+    );
+    let input_digest = if has_images {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(content)?))
+    } else {
+        format!("{:x}", Sha256::digest(raw.as_bytes()))
+    };
+    let text = if !has_images && marker(&text).is_some() {
+        text["[ThreadBridge request:".len() + 36 + 2..].to_owned()
+    } else {
+        text
+    };
+    Ok(Some(UserMessage {
+        message_id: message_id.into(),
+        text,
+        created_at: (created * 1000.0) as i64,
+        input_digest,
+        images,
+    }))
 }
 
 /// Preserve the old marker syntax exactly; only the prefix is removed from visible text.
@@ -90,51 +230,12 @@ pub fn read_turn(index: &Path, native: &str, turn: &str) -> Result<(Vec<UserMess
             continue;
         }
         let meta = &payload["internal_chat_message_metadata_passthrough"];
-        if meta["turn_id"] != turn || meta["content_item_kinds"] != serde_json::json!(["user.text"])
-        {
+        if meta["turn_id"] != turn {
             continue;
         }
-        let Some(content) = payload["content"].as_array() else {
-            continue;
-        };
-        if content.is_empty() || content.iter().any(|x| x["type"] != "input_text") {
-            continue;
+        if let Some(message) = parse_user(payload)? {
+            rows.push(message);
         }
-        let mut raw = String::new();
-        for item in content {
-            raw.push_str(
-                item["text"]
-                    .as_str()
-                    .context("user_turn_metadata_invalid")?,
-            );
-        }
-        ensure!(
-            !raw.is_empty() && raw.len() <= MAX_INPUT,
-            "user_turn_input_limit"
-        );
-        let message_id = payload["id"]
-            .as_str()
-            .context("user_turn_metadata_invalid")?;
-        let created = meta["create_time"]
-            .as_f64()
-            .context("user_turn_metadata_invalid")?;
-        ensure!(
-            message_id.chars().count() <= 128
-                && created.is_finite()
-                && (created * 1000.0).abs() <= i64::MAX as f64,
-            "user_turn_metadata_invalid"
-        );
-        let text = if marker(&raw).is_some() {
-            &raw["[ThreadBridge request:".len() + 36 + 2..]
-        } else {
-            &raw
-        };
-        rows.push(UserMessage {
-            message_id: message_id.into(),
-            text: text.into(),
-            created_at: (created * 1000.0) as i64,
-            input_digest: format!("{:x}", Sha256::digest(raw.as_bytes())),
-        });
         ensure!(rows.len() <= 100, "user_turn_input_limit");
     }
     bail!("user_turn_not_complete")
@@ -147,24 +248,36 @@ pub fn save_turn(
     rows: &[UserMessage],
     completed_at: i64,
 ) -> Result<()> {
+    save_messages(database, native, turn, rows, Some(completed_at))
+}
+pub fn save_messages(
+    database: &Path,
+    native: &str,
+    turn: &str,
+    rows: &[UserMessage],
+    completed_at: Option<i64>,
+) -> Result<()> {
     let mut db = crate::native_capture::open_database(database)?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS captured_user_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,input_digest TEXT NOT NULL,PRIMARY KEY(thread_id,message_id)); CREATE TABLE IF NOT EXISTS captured_turn_order(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(thread_id,turn_id));")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let old: Option<i64> = tx
-        .query_row(
-            "SELECT completed_at FROM captured_turn_order WHERE thread_id=?1 AND turn_id=?2",
-            params![native, turn],
-            |r| r.get(0),
-        )
-        .optional()?;
-    ensure!(
-        old.is_none_or(|value| value == completed_at),
-        "conflicting_turn_order"
-    );
-    tx.execute(
-        "INSERT OR IGNORE INTO captured_turn_order VALUES(?1,?2,?3)",
-        params![native, turn, completed_at],
-    )?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS captured_images(thread_id TEXT NOT NULL,message_id TEXT NOT NULL,image_id TEXT NOT NULL,mime TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(thread_id,message_id,image_id))")?;
+    if let Some(completed_at) = completed_at {
+        let old: Option<i64> = tx
+            .query_row(
+                "SELECT completed_at FROM captured_turn_order WHERE thread_id=?1 AND turn_id=?2",
+                params![native, turn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            old.is_none_or(|value| value == completed_at),
+            "conflicting_turn_order"
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO captured_turn_order VALUES(?1,?2,?3)",
+            params![native, turn, completed_at],
+        )?;
+    }
     for row in rows {
         let old: Option<(String, String, i64, String)> = tx.query_row("SELECT turn_id,text,created_at,input_digest FROM captured_user_messages WHERE thread_id=?1 AND message_id=?2", params![native, row.message_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?;
         ensure!(
@@ -188,11 +301,55 @@ pub fn save_turn(
                 row.input_digest
             ],
         )?;
+        for image in &row.images {
+            let existing: Option<(String, Vec<u8>)> = tx.query_row("SELECT mime,bytes FROM captured_images WHERE thread_id=?1 AND message_id=?2 AND image_id=?3",params![native,row.message_id,image.id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            ensure!(
+                existing
+                    .as_ref()
+                    .is_none_or(|(mime, bytes)| mime == &image.mime && bytes == &image.bytes),
+                "conflicting_user_image"
+            );
+            if existing.is_none() {
+                let used: i64 = tx.query_row(
+                    "SELECT coalesce(sum(length(bytes)),0) FROM captured_images",
+                    [],
+                    |r| r.get(0),
+                )?;
+                ensure!(
+                    used + image.bytes.len() as i64 <= 64 * 1024 * 1024,
+                    "image_storage_budget"
+                );
+                tx.execute(
+                    "INSERT INTO captured_images VALUES(?1,?2,?3,?4,?5)",
+                    params![native, row.message_id, image.id, image.mime, image.bytes],
+                )?;
+            }
+        }
     }
     tx.commit()?;
     Ok(())
 }
 
+pub fn load_images(db: &Connection, native: &str, message: &str) -> Result<Vec<UserImage>> {
+    if !db.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_images'",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        return Ok(vec![]);
+    }
+    let mut q=db.prepare("SELECT image_id,mime,bytes FROM captured_images WHERE thread_id=?1 AND message_id=?2 ORDER BY image_id")?;
+    let rows = q
+        .query_map(params![native, message], |r| {
+            Ok(UserImage {
+                id: r.get(0)?,
+                mime: r.get(1)?,
+                bytes: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
 pub fn capture_users(database: &Path, index: &Path, event: &Value) -> Result<()> {
     let native = event["thread-id"]
         .as_str()

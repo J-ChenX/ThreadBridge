@@ -2,7 +2,7 @@ plugins { id("com.android.application"); id("org.jetbrains.kotlin.android"); id(
 android {
  namespace = "dev.threadbridge"
  compileSdk = 35
- defaultConfig { applicationId = "dev.threadbridge"; minSdk = 26; targetSdk = 35; versionCode = 10; versionName = "0.1.9-test" }
+ defaultConfig { applicationId = "dev.threadbridge"; minSdk = 26; targetSdk = 35; versionCode = 15; versionName = "0.1.14-test" }
  defaultConfig {
   for (field in listOf("PUBLIC_TEST_SERVER", "PUBLIC_TEST_PREVIOUS_SERVER", "PUBLIC_TEST_HOST")) {
    val value = System.getenv("THREADBRIDGE_$field") ?: ""

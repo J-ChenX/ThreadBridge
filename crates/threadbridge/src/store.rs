@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS resume_owners(thread TEXT PRIMARY KEY,grant_hash TEXT
 CREATE TABLE IF NOT EXISTS capture_health(host TEXT PRIMARY KEY,status TEXT NOT NULL,checked_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS capture_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS capture_user_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS attachments(thread TEXT NOT NULL,message TEXT NOT NULL,image TEXT NOT NULL,mime TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(thread,message,image));
+CREATE TABLE IF NOT EXISTS capture_visible_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS thread_message_state(thread TEXT PRIMARY KEY,revision INTEGER NOT NULL,activity_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS completion_metadata(thread TEXT NOT NULL,turn TEXT NOT NULL,title TEXT NOT NULL,recorded_at INTEGER NOT NULL,PRIMARY KEY(thread,turn));
 CREATE TABLE IF NOT EXISTS capture_queue_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL,queue_id TEXT);
 CREATE TABLE IF NOT EXISTS capture_queue_send_times(id TEXT PRIMARY KEY,started_at INTEGER NOT NULL);
@@ -57,6 +60,15 @@ CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,thread TEXT NOT NULL,statu
 CREATE TABLE IF NOT EXISTS history_positions(thread TEXT PRIMARY KEY,cursor TEXT);
 CREATE TABLE IF NOT EXISTS tombstones(thread TEXT NOT NULL,message TEXT NOT NULL,PRIMARY KEY(thread,message));
 CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL,native_turn TEXT,error TEXT);")?;
+        let initialized: bool = c.query_row(
+            "SELECT count(*)>0 FROM settings WHERE k='message_state_initialized'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !initialized {
+            // Existing bodies establish activity, not a new unread mutation.
+            c.execute_batch("BEGIN IMMEDIATE; INSERT OR IGNORE INTO thread_message_state SELECT thread,0,max(ordinal) FROM messages GROUP BY thread; INSERT OR IGNORE INTO settings VALUES('message_state_initialized','1'); COMMIT;")?;
+        }
         let has_expiry = {
             let mut columns = c.prepare("PRAGMA table_info(outbox)")?;
             let names = columns
@@ -240,6 +252,8 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         let mut changed = old
             .as_ref()
             .is_none_or(|x| x.0 != t.status || x.1 != t.revision);
+        let mut message_changed = false;
+        let mut activity_at = 0;
         for m in &s.messages {
             let dead: i64 = tx.query_row(
                 "SELECT count(*) FROM tombstones WHERE thread=?1 AND message=?2",
@@ -251,9 +265,16 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             }
             let n=tx.execute("INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(thread,id) DO UPDATE SET body=excluded.body,version=excluded.version,ordinal=excluded.ordinal WHERE messages.version<>excluded.version OR messages.ordinal<>excluded.ordinal",params![t.id,m.id,m.turn_id,m.role,m.text,m.version,m.ordinal])?;
             changed |= n > 0;
+            message_changed |= n > 0;
+            if n > 0 {
+                activity_at = activity_at.max(m.ordinal);
+            }
             if let Some(title) = capture_title {
                 changed |= tx.execute("INSERT INTO completion_metadata(thread,turn,title,recorded_at) VALUES(?1,?2,?3,?4) ON CONFLICT(thread,turn) DO UPDATE SET title=excluded.title WHERE completion_metadata.title<>excluded.title",params![t.id,m.turn_id,title,m.ordinal/1000])?>0;
             }
+        }
+        if message_changed {
+            tx.execute("INSERT INTO thread_message_state VALUES(?1,1,?2) ON CONFLICT(thread) DO UPDATE SET revision=revision+1,activity_at=max(activity_at,excluded.activity_at)",params![t.id,activity_at])?;
         }
         if changed {
             tx.execute(
@@ -286,8 +307,8 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
     }
     pub fn threads(&self, offset: i64) -> Result<Value> {
         let c = self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END FROM threads t LEFT JOIN devices d ON d.id=t.host ORDER BY t.updated DESC,t.id LIMIT 50 OFFSET ?1")?;
-        let rows=q.query_map([offset],|r|Ok(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0) FROM threads t LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT 50 OFFSET ?1")?;
+        let rows=q.query_map([offset],|r|Ok(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15,"message_revision":r.get::<_,i64>(10)?,"message_activity_at":r.get::<_,i64>(11)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let cursor: i64 =
             c.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?;
         Ok(
@@ -539,6 +560,17 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         self.command(device, id)
     }
     /// Deletes the shared phone replica, never sends a native delete to Codex.
+    pub fn image(&self, thread: &str, message: &str, image: &str) -> Result<Value> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let c = self.0.lock().unwrap();
+        let (mime,bytes):(String,Vec<u8>)=c.query_row("SELECT a.mime,a.bytes FROM attachments a JOIN messages m ON m.thread=a.thread AND m.id=a.message WHERE a.thread=?1 AND a.message=?2 AND a.image=?3",params![thread,message,image],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let generation: String = c.query_row(
+            "SELECT v FROM settings WHERE k='collection_generation'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(json!({"mime":mime,"base64":STANDARD.encode(bytes),"collection_generation":generation}))
+    }
     pub fn delete_copy(&self, thread: &str) -> Result<Value> {
         anyhow::ensure!(
             thread.len() == 64 && thread.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -553,6 +585,9 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             "history_positions",
             "capture_import_positions",
             "capture_user_import_positions",
+            "capture_visible_import_positions",
+            "attachments",
+            "thread_message_state",
             "resume_owners",
             "outbox",
         ] {
@@ -586,15 +621,26 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             "INSERT OR IGNORE INTO tombstones VALUES(?1,?2)",
             params![thread, message.unwrap_or("")],
         )?;
+        tx.execute(
+            "DELETE FROM attachments WHERE thread=?1 AND (?2 IS NULL OR message=?2)",
+            params![thread, message],
+        )?;
         let kind = if let Some(id) = message {
-            tx.execute(
+            let removed = tx.execute(
                 "DELETE FROM messages WHERE thread=?1 AND id=?2",
                 params![thread, id],
             )?;
+            if removed > 0 {
+                tx.execute("INSERT INTO thread_message_state VALUES(?1,1,0) ON CONFLICT(thread) DO UPDATE SET revision=revision+1",[&thread])?;
+            }
             format!("delete_message:{id}")
         } else {
             tx.execute("DELETE FROM messages WHERE thread=?1", [&thread])?;
             tx.execute("DELETE FROM threads WHERE id=?1", [&thread])?;
+            tx.execute(
+                "DELETE FROM thread_message_state WHERE thread=?1",
+                [&thread],
+            )?;
             tx.execute("UPDATE commands SET status='rejected',error='source_deleted' WHERE thread=?1 AND status='accepted'",[&thread])?;
             "delete_thread".into()
         };

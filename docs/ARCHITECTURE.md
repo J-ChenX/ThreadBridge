@@ -33,7 +33,7 @@ flowchart LR
 | M06 Notification | `crates/threadbridge/src/notify.rs` | 持久 outbox、有效期和有界重试 |
 | M07 Operations | `main.rs`、`collection.rs`、`health.rs`、`native_fleet.rs`、`native_remote.rs`、`native_recovery.rs`、`collection_reset.rs`、`deploy/` | [运行与安装](运行与安装.md)、[多机接入](多机接入.md) |
 
-Hub 的命令账本、事件游标和通知 outbox 使用 SQLite WAL/FULL；手机 Room 为离线 UI 数据源；原 Codex 对话是原始正文和轮次的来源，ThreadBridge 只持有副本。原生身份结合 host/profile/thread 派生业务键，标题不参与路由。
+Hub 的命令账本、事件游标和通知 outbox 使用 SQLite WAL/FULL；Hub 的消息变化标记独立于完成轮次 ID，手机使用它与毫秒级活动时间判断未读和排序；手机 Room 为离线 UI 数据源；原 Codex 对话是原始正文和轮次的来源，ThreadBridge 只持有副本。原生身份结合 host/profile/thread 派生业务键，标题不参与路由。
 
 正式 proxy Adapter 仅附着已有服务。默认手机续聊可走经过版本验证的桌面 queue；队列入列不等于开始执行。独立 `threadbridge resume` 是有租约和权限约束的候选入口，不能以手机普通配对自动获得执行许可。
 

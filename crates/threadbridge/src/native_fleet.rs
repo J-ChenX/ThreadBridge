@@ -334,7 +334,17 @@ pub fn queue_snapshot(source: &Path, destination: &Path, blocked: &[String]) -> 
     let mut db = Connection::open(&tmp)?;
     db.execute_batch("PRAGMA journal_mode=DELETE;")?;
     let tx = db.transaction()?;
-    for table in TABLES {
+    for table in TABLES
+        .into_iter()
+        .chain(["captured_images", "captured_visible_messages"])
+    {
+        if !tx.query_row(
+            "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get::<_, bool>(0),
+        )? {
+            continue;
+        }
         for native in blocked {
             tx.execute(&format!("DELETE FROM {table} WHERE thread_id=?"), [native])?;
         }

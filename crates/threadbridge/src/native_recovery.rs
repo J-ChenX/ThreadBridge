@@ -61,17 +61,54 @@ fn value_rows(db: &Connection, query: &str) -> Result<Vec<Value>> {
 }
 pub fn binding(database: &Path) -> Result<String> {
     let mut digest = Sha256::new();
+    // Versioned, typed binary framing. Old recovery plans fail closed rather than
+    // being silently rebound after the representation changes.
+    digest.update(b"threadbridge-recovery-binding-v2\0");
     let db = native_remote::readonly(database)?;
     db.execute_batch("BEGIN")?;
     let mut used = 0u64;
-    for table in TABLES {
+    for table in TABLES
+        .into_iter()
+        .chain(["captured_images", "captured_visible_messages"])
+    {
+        if !db.query_row(
+            "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get::<_, bool>(0),
+        )? {
+            continue;
+        }
+        digest.update((table.len() as u64).to_le_bytes());
         digest.update(table.as_bytes());
-        for row in value_rows(&db, &format!("SELECT rowid,* FROM {table} ORDER BY rowid"))? {
-            let encoded = serde_json::to_vec(&row)?;
-            used += encoded.len() as u64;
-            ensure!(used <= 2 * DB_BYTES, "recovery_binding_budget");
-            digest.update(&encoded);
-            digest.update(b"\n");
+        let mut query = db.prepare(&format!("SELECT rowid,* FROM {table} ORDER BY rowid"))?;
+        let width = query.column_count();
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            digest.update(b"row");
+            digest.update((width as u64).to_le_bytes());
+            for column in 0..width {
+                let value = row.get_ref(column)?;
+                let integer;
+                let real;
+                let (tag, bytes): (u8, &[u8]) = match value {
+                    ValueRef::Null => (0, &[]),
+                    ValueRef::Integer(v) => {
+                        integer = v.to_le_bytes();
+                        (1, &integer)
+                    }
+                    ValueRef::Real(v) => {
+                        real = v.to_bits().to_le_bytes();
+                        (2, &real)
+                    }
+                    ValueRef::Text(v) => (3, v),
+                    ValueRef::Blob(v) => (4, v),
+                };
+                used += 9 + bytes.len() as u64;
+                ensure!(used <= 2 * DB_BYTES, "recovery_binding_budget");
+                digest.update([tag]);
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
         }
     }
     for path in [
@@ -323,9 +360,16 @@ pub fn batch_limits(
                             text: r.get(1)?,
                             created_at: r.get(2)?,
                             input_digest: r.get(3)?,
+                            images: vec![],
                         })
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+                for row in &mut stored {
+                    row.images = native_input::load_images(&db, native, &row.message_id)?;
+                }
+                for row in &mut users {
+                    row.images.sort_by(|a, b| a.id.cmp(&b.id));
+                }
                 let order=db.query_row("SELECT completed_at FROM captured_turn_order WHERE thread_id=? AND turn_id=?",[native.as_str(),turn.as_str()],|r|r.get::<_,i64>(0)).optional()?;
                 let sort = |v: &native_input::UserMessage| {
                     (
@@ -459,6 +503,41 @@ mod tests {
     use native_remote::fixtures::Fixture;
     fn prepared(f: &Fixture) -> PathBuf {
         prepare(&f.config, &f.db, &Uuid::new_v4().to_string()).unwrap()
+    }
+    #[test]
+    fn image_binding_streams_raw_bytes_and_invalidates_plans_after_changes() {
+        let mut f = Fixture::new();
+        f.append("human");
+        f.capture();
+        let db = Connection::open(&f.db).unwrap();
+        // 18 MiB fits both capture and remote budgets, but the old JSON byte
+        // arrays exceeded the 64 MiB binding budget and consumed hundreds of MiB.
+        let bytes = vec![255u8; 2 * 1024 * 1024];
+        for n in 0..9 {
+            db.execute(
+                "INSERT INTO captured_images VALUES(?1,?2,?3,'image/png',?4)",
+                rusqlite::params![
+                    f.native,
+                    n.to_string(),
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    bytes
+                ],
+            )
+            .unwrap();
+        }
+        let before = binding(&f.db).unwrap();
+        assert_eq!(before, binding(&f.db).unwrap());
+        let dir = prepared(&f);
+        db.execute(
+            "UPDATE captured_images SET bytes=zeroblob(2097152) WHERE message_id='0'",
+            [],
+        )
+        .unwrap();
+        assert_ne!(before, binding(&f.db).unwrap());
+        assert!(batch(&f.config, &f.db, &dir)
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_capture_changed"));
     }
     #[test]
     fn overflow_recovery_retains_failures_and_proves_healthy_source() {

@@ -365,10 +365,8 @@ pub fn capture(payload: &str, options: &CaptureOptions) -> Result<String> {
         return Ok("ignored".into());
     }
     let _lock = crate::collection::lock(&options.database)?;
-    let source = options
-        .user_turn_index
-        .as_deref()
-        .or(options.title_index.as_deref());
+    // The title index is JSONL, not a native SQLite identity/source index.
+    let source = options.user_turn_index.as_deref();
     if !crate::collection::allowed(&options.database, source, native)? {
         return Ok("ignored".into());
     }

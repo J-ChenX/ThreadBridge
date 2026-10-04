@@ -40,6 +40,11 @@ def main():
             ('test_resume_phone.py', ['--worker']),
             ('test_conversation_sync.py', []),
             ('test_capture_correlation.py', []),
+            ('test_subagent_cleanup.py', []),
+            ('test_capture_health_scope.py', []),
+            ('test_archived_cleanup.py', []),
+            ('test_visible_history.py', []),
+            ('test_android_migrations.py', []),
         ]
         for name, extra in cases:
             print(f'Running {name} {" ".join(str(x) for x in extra if str(x).startswith("--"))}', flush=True)

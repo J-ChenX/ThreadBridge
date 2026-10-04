@@ -104,23 +104,43 @@ async fn hosts(State(s): State<Hub>, h: HeaderMap) -> ApiResult {
 async fn capture_health(State(s): State<Hub>, h: HeaderMap) -> ApiResult {
     auth(&h, &s, "phone")?;
     let c = s.db.0.lock().unwrap();
-    let mut q=c.prepare("SELECT h.host,h.status,h.checked_at FROM capture_health h JOIN devices d ON d.id=h.host WHERE d.role='agent' AND d.revoked=0").map_err(|e|bad(e.into()))?;
+    let server_time = now();
+    let mut q=c.prepare("SELECT h.host,h.status,h.checked_at,d.last_seen,d.expires FROM capture_health h JOIN devices d ON d.id=h.host WHERE d.role='agent' AND d.revoked=0").map_err(|e|bad(e.into()))?;
     let rows = q
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| bad(e.into()))?;
     let mut hosts = Vec::new();
+    let mut offline_hosts = Vec::new();
     for row in rows {
-        let (host, status, checked_at) = row.map_err(|e| bad(e.into()))?;
+        let (host, status, checked_at, last_seen, expires) = row.map_err(|e| bad(e.into()))?;
         let status: Value = serde_json::from_str(&status).map_err(|e| bad(e.into()))?;
-        hosts.push(json!({"host_id":host,"status":status,"checked_at":checked_at}));
+        let online = last_seen > server_time - 15 && expires > server_time;
+        let unresolved = status["failures"]
+            .as_object()
+            .is_none_or(|failures| !failures.is_empty())
+            || status["overflow"] == true
+            || status.get("projection_error").is_some();
+        // A stopped remote monitor's last healthy snapshot is an offline device,
+        // not an unconfirmed capture on another active computer. Keep its original
+        // timestamp and state separately; unresolved failures are always visible.
+        let row = json!({"host_id":host,"status":status,"checked_at":checked_at,"online":online});
+        if !online && server_time - checked_at > 30 && !unresolved {
+            offline_hosts.push(row);
+        } else {
+            hosts.push(row);
+        }
     }
-    Ok(Json(json!({"hosts":hosts,"server_time":now()})))
+    Ok(Json(
+        json!({"hosts":hosts,"offline_hosts":offline_hosts,"server_time":server_time}),
+    ))
 }
 async fn threads(State(s): State<Hub>, h: HeaderMap, Query(q): Query<Paging>) -> ApiResult {
     auth(&h, &s, "phone")?;
@@ -154,6 +174,16 @@ async fn chunk(
     )
     .map(Json)
     .map_err(|_| ApiError(StatusCode::CONFLICT, "message_version_changed".into()))
+}
+async fn image(
+    State(s): State<Hub>,
+    h: HeaderMap,
+    Path((id, msg, image)): Path<(String, String, String)>,
+) -> ApiResult {
+    auth(&h, &s, "phone")?;
+    s.db.image(&id, &msg, &image)
+        .map(Json)
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "image_unavailable".into()))
 }
 async fn submit(State(s): State<Hub>, h: HeaderMap, Json(p): Json<Submit>) -> ApiResult {
     let d = auth(&h, &s, "phone")?;
@@ -264,6 +294,7 @@ pub async fn run(db: Store, listen: &str) -> anyhow::Result<()> {
         .route("/v1/hosts", get(hosts))
         .route("/v1/threads", get(threads))
         .route("/v1/threads/{id}/delete", post(delete_copy))
+        .route("/v1/threads/{id}/messages/{msg}/images/{image}", get(image))
         .route("/v1/capture-health", get(capture_health))
         .route("/v1/threads/{id}/messages", get(messages))
         .route("/v1/threads/{id}/messages/{msg}/body", get(chunk))
