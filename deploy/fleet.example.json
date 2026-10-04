@@ -1,0 +1,17 @@
+{
+  "binary": "/path/to/threadbridge",
+  "hub_db": "/protected/path/hub.sqlite",
+  "hosts": {
+    "hub": {"local": true, "host_id": "existing-agent-id"},
+    "workstation": {
+      "ssh": "operator@100.64.0.10",
+      "platform": "linux",
+      "python": "/usr/bin/python3",
+      "helper": "/home/operator/.local/lib/threadbridge/fleet/remote_capture.py",
+      "codex_home": "/home/operator/.codex",
+      "codex": "/path/to/codex",
+      "host_id": "independently-registered-agent-id",
+      "verified_version": null
+    }
+  }
+}

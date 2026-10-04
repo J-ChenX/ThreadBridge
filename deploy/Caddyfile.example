@@ -1,0 +1,8 @@
+# Local TLS termination; configure cpolar for verified TLS passthrough.
+bridge.example.com {
+    encode gzip
+    request_body {
+        max_size 64KB
+    }
+    reverse_proxy 127.0.0.1:8787
+}

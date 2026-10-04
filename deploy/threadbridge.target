@@ -1,0 +1,7 @@
+[Unit]
+Description=ThreadBridge service group
+Wants=threadbridge-phone-hub.service threadbridge-phone-inbox.service threadbridge-phone-capture.service
+After=network-online.target
+
+[Install]
+WantedBy=default.target

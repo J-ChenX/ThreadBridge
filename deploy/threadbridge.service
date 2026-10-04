@@ -1,0 +1,21 @@
+[Unit]
+Description=ThreadBridge Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/ThreadBridge
+EnvironmentFile=-%h/.config/threadbridge/notification.env
+ExecStart=%h/code/ThreadBridge/target/release/threadbridge hub --db %h/.local/share/threadbridge/hub.sqlite --listen 127.0.0.1:8787
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=default.target

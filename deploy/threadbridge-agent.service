@@ -1,0 +1,19 @@
+[Unit]
+Description=ThreadBridge Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/ThreadBridge
+ExecStart=%h/code/ThreadBridge/target/release/threadbridge agent --config %h/.config/threadbridge/agent.json --db %h/.local/share/threadbridge/agent.sqlite
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+MemoryHigh=64M
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
