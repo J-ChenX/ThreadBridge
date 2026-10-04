@@ -206,7 +206,7 @@ impl Protocol {
                 let line = self.buffer.drain(..=end).collect::<Vec<_>>();
                 return Ok(serde_json::from_slice(&line)?);
             }
-            let mut chunk = [0; 65536];
+            let mut chunk = vec![0; 65536];
             let left = deadline.saturating_duration_since(Instant::now());
             let size = timeout(left, self.output.read(&mut chunk))
                 .await
@@ -783,7 +783,17 @@ async fn worker_inner(
         tx.execute("INSERT INTO resume_owners(thread,grant_hash,expires,last_seen) VALUES(?,?,?,?) ON CONFLICT(thread) DO UPDATE SET grant_hash=excluded.grant_hash,expires=excluded.expires,last_seen=excluded.last_seen",params![thread,digest,grant.expires_at,now()])?;tx.commit()?;
         let mut iterations=0;loop {
             validate_grant(grant)?;reconcile_completed(database,capture_db,grant)?;ensure!(match competitor{Some(v)=>v,None=>competitor_inactive().await?},"competing_queue_worker_started");
-            let tx=c.transaction()?;tx.execute("UPDATE devices SET last_seen=? WHERE id=?",params![now(),grant.host_id])?;tx.execute("UPDATE resume_owners SET last_seen=? WHERE thread=? AND grant_hash=?",params![now(),thread,digest])?;tx.execute("UPDATE capture_targets SET queue_enabled=1,last_seen=? WHERE thread=?",params![now(),thread])?;tx.execute("UPDATE threads SET can_send=1,status='resume_ready' WHERE id=?",[&thread])?;tx.commit()?;
+            {
+                // Serialize the policy check and lease publication with collection mutation.
+                let _publication_guard=crate::collection::lock(capture_db)?;
+                require_capture_policy(capture_db,&grant.native_id)?;
+                let tx=c.transaction()?;
+                tx.execute("UPDATE devices SET last_seen=? WHERE id=?",params![now(),grant.host_id])?;
+                tx.execute("UPDATE resume_owners SET last_seen=? WHERE thread=? AND grant_hash=?",params![now(),thread,digest])?;
+                tx.execute("UPDATE capture_targets SET queue_enabled=1,last_seen=? WHERE thread=?",params![now(),thread])?;
+                tx.execute("UPDATE threads SET can_send=1,status='resume_ready' WHERE id=?",[&thread])?;
+                tx.commit()?;
+            }
             let pending:Option<String>=c.query_row("SELECT id FROM commands WHERE thread=? AND status='accepted' AND expires>? ORDER BY created LIMIT 1",params![thread,now()],|r|r.get(0)).optional()?;
             if let Some(command)=pending{dispatch(database,capture_db,codex,grant,&command,true,Duration::from_secs((grant.expires_at-now()).clamp(1,900) as u64),Duration::from_secs(10)).await?;}
             iterations+=1;if stop_after.is_some_and(|n|iterations>=n){return Ok(())}
@@ -1481,6 +1491,71 @@ fn main(){
         assert_eq!(
             f.worker(true).await.unwrap_err().to_string(),
             "collection_target_excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_disable_stops_worker_and_releases_advertised_lease() {
+        let f = Fixture::new();
+        let policy = json!({"schema":1,"generation":uuid::Uuid::new_v4().to_string(),"cutoff_ms":1,"excluded":[]});
+        crate::collection::write_policy(&f.capture, &policy).unwrap();
+        let operation = worker_inner(
+            &f.db,
+            &f.capture,
+            &f.binary,
+            &f.grant,
+            true,
+            Some(true),
+            None,
+            Duration::from_millis(10),
+        );
+        let disable = async {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let c = Connection::open(&f.db).unwrap();
+                if read_receipt(&c, &f.command).unwrap().0 == "codex_accepted" {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not dispatch fixture command"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut policy = policy;
+            policy["enabled"] = json!(false);
+            crate::collection::write_policy(&f.capture, &policy).unwrap();
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(operation, disable)
+        })
+        .await
+        .expect("disabled worker must stop promptly");
+        assert_eq!(result.unwrap_err().to_string(), "collection_disabled");
+        assert_eq!(f.starts(), 1);
+        let c = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            c.query_row("SELECT can_send,status FROM threads", [], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?
+            )))
+            .unwrap(),
+            (0, "capture_only".into())
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT queue_enabled,last_seen FROM capture_targets",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            c.query_row("SELECT last_seen FROM resume_owners", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 
