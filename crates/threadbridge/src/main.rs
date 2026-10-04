@@ -53,17 +53,6 @@ enum Commands {
         #[arg(long)]
         database: PathBuf,
     },
-    /// Save current-turn human input from an explicitly configured local index.
-    CaptureUsers {
-        #[arg(long)]
-        database: PathBuf,
-        #[arg(long)]
-        index: PathBuf,
-        #[arg(long)]
-        thread: String,
-        #[arg(long)]
-        turn: String,
-    },
     CaptureSync {
         #[arg(long)]
         db: PathBuf,
@@ -347,18 +336,6 @@ async fn main() -> Result<()> {
             }
         },
         Commands::CaptureHealth { database } => println!("{}", health::read(&database)?),
-        Commands::CaptureUsers {
-            database,
-            index,
-            thread,
-            turn,
-        } => {
-            native_input::capture_users(
-                &database,
-                &index,
-                &serde_json::json!({"thread-id":thread,"turn-id":turn}),
-            )?;
-        }
         Commands::CaptureSync {
             db,
             capture_db,

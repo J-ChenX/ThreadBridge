@@ -2,7 +2,6 @@
 //! Unknown receipts are never replayed; only an authoritative captured turn can settle them.
 use anyhow::{bail, ensure, Result};
 use clap::Args;
-use fs2::FileExt;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -710,21 +709,10 @@ async fn competitor_inactive() -> Result<bool> {
     .await??;
     Ok(status.code() == Some(3))
 }
-#[cfg(unix)]
 fn owner_lock(database: &Path, thread: &str) -> Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = PathBuf::from(format!("{}.{thread}.resume.lock", database.display()));
-    // Linux deployment: refuse symlink lock paths, as the prior O_NOFOLLOW lock did.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.try_lock_exclusive()
-        .map_err(|_| anyhow::anyhow!("resume_owner_running"))?;
+    let path = crate::collection::suffix(database, &format!(".{thread}.resume.lock"));
+    let file = crate::collection::open_file(&path, true, true)?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|_| anyhow::anyhow!("resume_owner_running"))?;
     Ok(file)
 }
 pub async fn worker(
