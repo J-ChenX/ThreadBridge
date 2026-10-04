@@ -84,7 +84,10 @@ pub fn lock(database: &Path) -> Result<Lock> {
     loop {
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(Lock(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
                 ensure!(Instant::now() < deadline, "collection_lock_timeout");
                 std::thread::sleep(Duration::from_millis(50));
             }
