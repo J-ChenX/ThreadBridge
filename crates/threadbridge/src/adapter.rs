@@ -274,32 +274,21 @@ impl Drop for Adapter {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
 
     async fn fixture(loaded: bool) -> (tempfile::TempDir, Adapter) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex-fixture");
-        let script = format!(
-            r#"#!/usr/bin/env python3
-import sys,json
-if '--version' in sys.argv:
- print('codex-cli fixture');sys.exit(0)
-for line in sys.stdin:
- r=json.loads(line)
- if 'id' not in r:continue
- method=r['method']
- if method=='initialize':result={{}}
- elif method=='thread/loaded/list':result={{'data':{ids}}}
- elif method=='thread/read':result={{'thread':{{'id':'original','status':{{'type':'idle'}},'updatedAt':1}}}}
- elif method=='thread/turns/list':result={{'data':[{{'id':'prior','status':'completed','items':[]}}],'nextCursor':None}}
- elif method=='turn/start':result={{'turn':{{'id':'existing-task-turn'}}}}
- else:raise RuntimeError('unexpected method')
- print(json.dumps({{'id':r['id'],'result':result}}),flush=True)
-"#,
-            ids = if loaded { "['original']" } else { "[]" }
-        );
-        std::fs::write(&path, script).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            json!({"mode": "proxy", "loaded": loaded}).to_string(),
+        )
+        .unwrap();
+        symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mock_codex.py"),
+            &path,
+        )
+        .unwrap();
         let adapter = Adapter::connect(&path, None, Some("codex-cli fixture"))
             .await
             .unwrap();

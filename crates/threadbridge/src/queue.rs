@@ -147,7 +147,7 @@ pub async fn dispatch(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     const NATIVE: &str = "00000000-0000-4000-8000-000000000001";
     fn fixture(reply: bool) -> (tempfile::TempDir, Store, std::path::PathBuf, Command) {
         let dir = tempfile::tempdir().unwrap();
@@ -166,10 +166,17 @@ mod tests {
             c.execute("INSERT INTO commands VALUES(?1,'phone',?1,'digest','host',?2,'{}','dispatching',?3,?4,NULL,NULL)",rusqlite::params![id,thread,now(),now()+60]).unwrap();
         }
         let bin = dir.path().join("mock-codex");
-        let count = dir.path().join("calls");
-        let code=format!("#!/usr/bin/python3\nimport sys\nwith open({:?},'a') as f:f.write('call\\n')\nassert sys.argv[1]=='queue'\nassert sys.argv[sys.argv.index('--thread')+1]=={:?}\nassert sys.argv[sys.argv.index('--message')+1]== 'explicit phone action'\n{}\n",count.to_str().unwrap(),NATIVE,if reply {format!("print('Queued message 00000000-0000-4000-8000-000000000004 for thread {NATIVE}.')")}else{"print('uncertain')".into()});
-        std::fs::write(&bin, code).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            dir.path().join("fixture.json"),
+            serde_json::json!({"mode": "queue", "native_id": NATIVE, "reply": reply}).to_string(),
+        )
+        .unwrap();
+        symlink(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/mock_codex.py"),
+            &bin,
+        )
+        .unwrap();
         let cmd = Command {
             id: id.into(),
             thread_id: thread,
