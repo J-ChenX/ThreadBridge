@@ -1,8 +1,17 @@
 mod adapter;
 mod agent;
 mod capture;
+mod collection;
+mod collection_reset;
+mod health;
 mod hub;
 mod model;
+mod native_capture;
+mod native_fleet;
+mod native_input;
+mod native_recovery;
+mod native_remote;
+mod native_resume;
 mod notify;
 #[cfg(unix)]
 mod probe;
@@ -27,6 +36,34 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Native fleet deployment, lifecycle and fixed SSH transport.
+    Fleet(native_fleet::FleetArgs),
+    /// Allowlisted remote RPC; reads one bounded JSON request from stdin.
+    RemoteCapture(native_remote::RemoteArgs),
+    /// Offline backup-bound capture health revalidation; never sends a message.
+    RecoverCaptureHealth(native_recovery::RecoveryArgs),
+    /// Inspect a complete collection baseline; --apply explicitly resets replicas.
+    CollectionReset(collection_reset::ResetArgs),
+    /// Explicit grant and execute-gated original-ID resume candidate.
+    Resume(native_resume::ResumeArgs),
+    /// Persist a completed notify event using an explicit collection scope.
+    Capture(CaptureArgs),
+    /// Read the compatible durable capture status without exposing event bodies.
+    CaptureHealth {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Save current-turn human input from an explicitly configured local index.
+    CaptureUsers {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        turn: String,
+    },
     CaptureSync {
         #[arg(long)]
         db: PathBuf,
@@ -142,6 +179,19 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Manual private backup bundle, including optional credentials and signing files.
+    BackupBundle {
+        #[arg(long)]
+        hub_db: PathBuf,
+        #[arg(long)]
+        agent_db: Vec<PathBuf>,
+        #[arg(long)]
+        credential_file: Vec<PathBuf>,
+        #[arg(long)]
+        signing_dir: Option<PathBuf>,
+        #[arg(long)]
+        destination: PathBuf,
+    },
     Restore {
         #[arg(long)]
         backup: PathBuf,
@@ -154,6 +204,50 @@ enum Commands {
         #[arg(long)]
         reconciled: bool,
     },
+}
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("scope").required(true).multiple(false).args(["thread", "catalog", "all_tasks"])))]
+struct CaptureArgs {
+    #[arg(long)]
+    database: PathBuf,
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    catalog: Option<PathBuf>,
+    #[arg(long)]
+    all_tasks: bool,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long)]
+    title_index: Option<PathBuf>,
+    #[arg(long)]
+    user_turn_index: Option<PathBuf>,
+    #[arg(long)]
+    storage_budget_bytes: Option<u64>,
+    #[arg(long, default_value_t = native_capture::MIN_FREE_BYTES)]
+    min_free_bytes: u64,
+    #[arg(long)]
+    legacy_limits: bool,
+    #[arg(long)]
+    store_candidates: bool,
+    payload: String,
+}
+impl CaptureArgs {
+    fn options(&self) -> native_capture::CaptureOptions {
+        native_capture::CaptureOptions {
+            database: self.database.clone(),
+            thread: self.thread.clone(),
+            catalog: self.catalog.clone(),
+            all_tasks: self.all_tasks,
+            title: self.title.clone(),
+            title_index: self.title_index.clone(),
+            user_turn_index: self.user_turn_index.clone(),
+            storage_budget: self.storage_budget_bytes,
+            min_free_bytes: self.min_free_bytes,
+            legacy_limits: self.legacy_limits,
+            store_candidates: self.store_candidates,
+        }
+    }
 }
 fn agent_config(
     path: PathBuf,
@@ -202,9 +296,69 @@ fn start_notifications(db: Store, url: String) -> Result<()> {
     });
     Ok(())
 }
+fn private_directory(path: &std::path::Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    Ok(())
+}
+fn copy_private(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(!source.is_symlink(), "backup_symlink_refused");
+    if source.is_dir() {
+        private_directory(destination)?;
+        for row in std::fs::read_dir(source)? {
+            let row = row?;
+            copy_private(&row.path(), &destination.join(row.file_name()))?;
+        }
+    } else {
+        use std::io::Write;
+        let mut source = std::fs::File::open(source)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(destination)?;
+        std::io::copy(&mut source, &mut file)?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     match Cli::parse().command {
+        Commands::Fleet(args) => native_fleet::run(args).await?,
+        Commands::RemoteCapture(args) => native_remote::run(args).await?,
+        Commands::RecoverCaptureHealth(args) => native_recovery::run(args).await?,
+        Commands::CollectionReset(args) => collection_reset::run(args).await?,
+        Commands::Resume(args) => native_resume::run(args).await?,
+        Commands::Capture(args) => match native_capture::capture(&args.payload, &args.options()) {
+            Ok(result) => println!("{result}"),
+            Err(_) => {
+                eprintln!("completion capture failed; no event content logged");
+                std::process::exit(2);
+            }
+        },
+        Commands::CaptureHealth { database } => println!("{}", health::read(&database)?),
+        Commands::CaptureUsers {
+            database,
+            index,
+            thread,
+            turn,
+        } => {
+            native_input::capture_users(
+                &database,
+                &index,
+                &serde_json::json!({"thread-id":thread,"turn-id":turn}),
+            )?;
+        }
         Commands::CaptureSync {
             db,
             capture_db,
@@ -377,6 +531,44 @@ async fn main() -> Result<()> {
         Commands::Backup { db, output } => {
             Store::open(&db)?.backup(&output)?;
             println!("Consistent SQLite backup: {}", output.display());
+        }
+        Commands::BackupBundle {
+            hub_db,
+            agent_db,
+            credential_file,
+            signing_dir,
+            destination,
+        } => {
+            if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)?;
+            }
+            private_directory(&destination)?;
+            let mut databases = Vec::new();
+            for (i, source) in std::iter::once(hub_db).chain(agent_db).enumerate() {
+                let name = if i == 0 {
+                    "hub.sqlite".into()
+                } else {
+                    format!("agent-{i}.sqlite")
+                };
+                anyhow::ensure!(source.is_file(), "backup_requires_existing_database");
+                Store::open(&source)?.backup(&destination.join(&name))?;
+                databases.push(serde_json::json!({"source":source.canonicalize()?,"backup":name}));
+            }
+            for (i, source) in credential_file.iter().enumerate() {
+                copy_private(source, &destination.join(format!("credential-{i}.json")))?;
+            }
+            if let Some(source) = &signing_dir {
+                copy_private(source, &destination.join("signing"))?;
+            }
+            let manifest = serde_json::json!({"format":1,"contains_secrets":!credential_file.is_empty()||signing_dir.is_some(),"databases":databases});
+            collection::atomic(
+                &destination.join("manifest.json"),
+                &serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            println!(
+                "Local backup complete: {}. Keep it in encrypted local storage.",
+                destination.display()
+            );
         }
         Commands::Restore {
             backup,

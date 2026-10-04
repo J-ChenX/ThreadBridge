@@ -1,6 +1,6 @@
 # 续桥 · ThreadBridge
 
-在 Android 手机上查看电脑 Codex 对话的用户消息和最终回复，并按原 thread ID 继续对话。Rust 提供 Hub、Agent 与持久账本，Kotlin/Compose 提供手机客户端，Python 脚本负责完成捕获和多机运维。
+在 Android 手机上查看电脑 Codex 对话的用户消息和最终回复，并按原 thread ID 继续对话。Rust 统一提供 Hub、Agent、持久账本、完成采集、用户轮次读取、跨机运维与受限 resume 工作器；Kotlin/Compose 提供手机客户端。Python 仅用于独立集成测试、Android 工具和两个旧路径启动器。
 
 当前 Android 版本为 **0.1.9-test**，核心 CLI 包版本为 **0.1.0**。已有四机接入及指定原对话续聊的运行记录；完整日常使用、24–72 小时稳定性、真机锁屏推送和资源预算仍需验收。指定版本、单次续聊或模拟器通过不能代表所有 Codex 版本均兼容。
 
@@ -10,8 +10,7 @@
 |---|---|
 | `crates/threadbridge/` | Rust CLI、Hub、Agent、协议、SQLite、通知和接入适配器 |
 | `android/` | Android 应用、JVM 测试、Room schema 和 Gradle Wrapper |
-| `scripts/` | 稳定捕获入口、部署运维、APK 构建与校验、电脑预览 |
-| `tests/python/` | Python 单元回归 |
+| `scripts/` | 旧 notify/systemd 路径启动器、APK 构建与校验、Android 预览 |
 | `tests/integration/` | 合成数据、回环 Hub 与 mock Codex 的收发和恢复测试 |
 | `tests/android/` | 专用模拟器的合成数据与实际界面 QA |
 | `docs/` | 当前产品约束、架构、模块合同、部署和维护方法 |
@@ -21,13 +20,13 @@
 
 ## 构建与验证
 
-Rust 工具链固定为 1.98.1，Python 使用标准库，CI 覆盖 3.10 与 3.14；Android 使用 JDK 17、SDK 35 和 Gradle Wrapper 8.11.1。
+Rust 工具链固定为 1.98.1；Rust 单元回归在 Linux/Windows 运行，独立 Python 集成测试仅使用标准库，CI 覆盖 3.10 与 3.14；Android 使用 JDK 17、SDK 35 和 Gradle Wrapper 8.11.1。
 
 ```sh
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --locked
-python3 tests/run.py
+python3 tests/run.py --integration-only
 ```
 
 Android 无签名回归：

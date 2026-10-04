@@ -17,14 +17,14 @@ def main():
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/release/threadbridge')
     args = parser.parse_args()
     env = os.environ.copy()
-    env['PYTHONPATH'] = os.pathsep.join(str(p) for p in [ROOT / 'scripts', ROOT / 'tests/python'])
+    env['PYTHONPATH'] = str(ROOT / 'tests/integration')
     env['PYTHONDONTWRITEBYTECODE'] = '1'
 
     def run(*command):
         subprocess.run([sys.executable, *map(str, command)], cwd=ROOT, env=env, check=True)
 
     if not args.integration_only:
-        run('-m', 'unittest', 'discover', '-s', ROOT / 'tests/python', '-p', 'test_*.py')
+        subprocess.run(['cargo', 'test', '--workspace', '--locked'], cwd=ROOT, env=env, check=True)
     if not args.unit_only:
         binary = args.binary.resolve()
         if not binary.is_file():
@@ -32,14 +32,14 @@ def main():
         cases = [
             ('smoke.py', []),
             ('test_capture_sync.py', []),
-            ('test_capture_bridge.py', [ROOT / 'scripts/capture_reply.py']),
-            ('test_capture_bridge.py', [ROOT / 'scripts/capture_reply.py', '--all']),
-            ('test_saved_inbox.py', [ROOT / 'scripts/capture_catalog.py']),
-            ('test_saved_inbox.py', [ROOT / 'scripts/capture_catalog.py', '--all']),
+            ('test_capture_bridge.py', []),
+            ('test_capture_bridge.py', ['--all']),
+            ('test_saved_inbox.py', []),
+            ('test_saved_inbox.py', ['--all']),
             ('test_resume_phone.py', []),
             ('test_resume_phone.py', ['--worker']),
             ('test_conversation_sync.py', []),
-            ('test_capture_correlation.py', [binary]),
+            ('test_capture_correlation.py', []),
         ]
         for name, extra in cases:
             print(f'Running {name} {" ".join(str(x) for x in extra if str(x).startswith("--"))}', flush=True)

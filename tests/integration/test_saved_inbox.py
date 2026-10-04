@@ -4,7 +4,7 @@ from contextlib import closing
 import hashlib,json,os,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
 from pathlib import Path
 def main():
-    binary=Path(sys.argv[1]).resolve();receiver=Path(sys.argv[2]).resolve();all_mode='--all' in sys.argv[3:]
+    binary=Path(sys.argv[1]).resolve();all_mode='--all' in sys.argv[2:]
     ids=['00000000-0000-4000-8000-000000000011','00000000-0000-4000-8000-000000000012']
     with tempfile.TemporaryDirectory(prefix='tb-saved-inbox-') as tmp:
      root=Path(tmp);db=root/'hub.sqlite';capture=root/'capture.sqlite';catalog=root/'catalog.json';catalog.write_text(json.dumps(dict.fromkeys(ids,'同名任务'),ensure_ascii=False))
@@ -14,7 +14,8 @@ def main():
      env={'PATH':'/usr/bin:/bin','HOME':str(root)}
      for i,native in enumerate(ids):
       event={'type':'agent-turn-complete','thread-id':native,'turn-id':native,'last-assistant-message':'saved final '+str(i),'input-messages':['PRIVATE INPUT'],'cwd':'PRIVATE PATH'}
-      subprocess.run([sys.executable,receiver,*receiver_scope,'--database',capture,json.dumps(event)],env=env,check=True,stdout=subprocess.DEVNULL)
+      captured=subprocess.run([binary,'capture',*receiver_scope,'--database',capture,json.dumps(event)],env=env,check=True,capture_output=True,text=True)
+      assert captured.stdout.strip()=='captured' and not captured.stderr
      with closing(sqlite3.connect(db)) as c, c:
       c.execute('CREATE TABLE devices(id TEXT PRIMARY KEY,token TEXT UNIQUE,role TEXT NOT NULL,name TEXT NOT NULL,expires INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,last_seen INTEGER NOT NULL DEFAULT 0)')
       c.execute("INSERT INTO devices(id,role,name,expires) VALUES('host','agent','fixture',?)",(int(time.time())+300,))
@@ -46,16 +47,19 @@ def main():
        assert m['completion_title']=='同名任务' and m['turn_id']==row['native_id'] and m['recorded_at']>0
        assert m['text']=='saved final '+str(ids.index(row['native_id']))
       if all_mode:
-       # Actual interpreter failure, polling visibility, exact event retry, duplicates.
+       # Actual native CLI failure, polling visibility, exact event retry, duplicates.
        failed_event={'type':'agent-turn-complete','thread-id':ids[0],'turn-id':'00000000-0000-4000-8000-000000000013','last-assistant-message':'retry final'}
-       argv=[sys.executable,receiver,*receiver_scope,'--database',capture]
+       argv=[binary,'capture',*receiver_scope,'--database',capture]
        failed=subprocess.run([*argv,'--storage-budget-bytes','1',json.dumps(failed_event)],env=env,capture_output=True);assert failed.returncode==2
+       assert failed.stdout==b'' and failed.stderr==b'completion capture failed; no event content logged\n'
        health=wait(lambda:api('/v1/capture-health')['hosts'][0]['status'] if api('/v1/capture-health')['hosts'] and api('/v1/capture-health')['hosts'][0]['status'].get('failures') else None)
        assert next(iter(health['failures'].values()))['reason']=='storage_budget_exceeded'
        assert len(api('/v1/threads/'+next(r['id'] for r in rows if r['native_id']==ids[0])+'/messages')['messages'])==1
        # Failure remains readable after Hub restart before retry.
        hub.terminate();hub.wait(timeout=3);hub=start();assert api('/v1/capture-health')['hosts'][0]['status']['failures']
-       for _ in range(2):subprocess.run([*argv,json.dumps(failed_event)],env=env,check=True,stdout=subprocess.DEVNULL)
+       for expected in ['captured','duplicate']:
+        retry=subprocess.run([*argv,json.dumps(failed_event)],env=env,check=True,capture_output=True,text=True)
+        assert retry.stdout.strip()==expected and not retry.stderr
        wait(lambda:api('/v1/capture-health')['hosts'] and not api('/v1/capture-health')['hosts'][0]['status'].get('failures'))
        wait(lambda:len(api('/v1/threads/'+next(r['id'] for r in rows if r['native_id']==ids[0])+'/messages')['messages'])==2)
       # Stop projection/sending side entirely; only PC HTTP storage remains.

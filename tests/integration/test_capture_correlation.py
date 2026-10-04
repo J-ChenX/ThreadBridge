@@ -3,13 +3,17 @@
 from contextlib import closing
 import hashlib,json,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
 from pathlib import Path
-from capture_completion import capture as old_capture
-from capture_completion_v014 import capture as candidate_capture
-from test_resume_dispatch import HOST,NATIVE,PRIOR,TURN
+HOST='00000000-0000-4000-8000-000000000051'
+NATIVE='00000000-0000-4000-8000-000000000052'
+PRIOR='00000000-0000-4000-8000-000000000053'
+TURN='00000000-0000-4000-8000-000000000054'
 
 def run_case(binary,mode):
  with tempfile.TemporaryDirectory(prefix='tb-correlation-') as temp:
-  root=Path(temp);db=root/'hub.sqlite';source=root/'capture.sqlite';old=str(uuid.uuid4());receiver=old_capture if mode=='legacy' else candidate_capture
+  root=Path(temp);db=root/'hub.sqlite';source=root/'capture.sqlite';old=str(uuid.uuid4())
+  def receiver(payload,native,database,title):
+   subprocess.run([binary,'capture','--thread',native,'--database',database,'--title',title,*([] if mode=='legacy' else ['--store-candidates']),payload],check=True,stdout=subprocess.DEVNULL)
+  old_capture=receiver
   old_capture(json.dumps({'type':'agent-turn-complete','thread-id':NATIVE,'turn-id':PRIOR,'last-assistant-message':'prior final'}),NATIVE,source,'same title')
   env={'PATH':'/usr/bin:/bin','HOME':temp}
   with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -59,7 +63,7 @@ def run_case(binary,mode):
   finally:process.terminate();process.wait(timeout=3)
 
 def main():
- candidate=Path(sys.argv[1]).resolve();old=Path(sys.argv[2]).resolve()
+ candidate=Path(sys.argv[1]).resolve();old=candidate
  run_case(old,'legacy')
  for mode in ['unique','two_active','no_marker','wrong_revision']:run_case(candidate,mode)
  print('PASS: reproduced old multi-marker loss; candidate UUID-only active-request disambiguation; ambiguous/no marker/wrong revision refuse ack; prior final untouched; no real data or sends')

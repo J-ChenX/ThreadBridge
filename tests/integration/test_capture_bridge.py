@@ -2,20 +2,19 @@
 """Temporary loopback Hub, synthetic phone and mock CLI only; no real sends."""
 from contextlib import closing
 import hashlib,json,os,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
-from capture_user_turn import save_turn
+from test_conversation_sync import save_turn
 from pathlib import Path
 def main():
     binary=Path(sys.argv[1]).resolve()
-    receiver=Path(sys.argv[2]).resolve()
     thread='00000000-0000-4000-8000-000000000001'
     turn='00000000-0000-4000-8000-000000000002'
     thread2='00000000-0000-4000-8000-000000000006'
-    all_threads='--all' in sys.argv[3:]
+    all_threads='--all' in sys.argv[2:]
     with tempfile.TemporaryDirectory(prefix='tb-mock-bridge-') as tmp:
      root=Path(tmp);db=root/'hub.sqlite';capture=root/'capture.sqlite';calls=root/'calls';mode=root/'mode';mode.write_text('ack')
      env={'PATH':'/usr/bin:/bin','HOME':str(root)}
      event={'thread-id':thread,'turn-id':turn,'type':'agent-turn-complete','last-assistant-message':'baseline'}
-     def emit(e):subprocess.run([sys.executable,receiver,'--thread',e['thread-id'],'--database',capture,json.dumps(e)],check=True,stdout=subprocess.DEVNULL,env=env)
+     def emit(e):subprocess.run([binary,'capture','--legacy-limits','--thread',e['thread-id'],'--database',capture,json.dumps(e)],check=True,stdout=subprocess.DEVNULL,env=env)
      clock=int(time.time())*1000
      save_turn(capture,thread,turn,[('desktop-input','desktop hello',clock-500,hashlib.sha256(b'desktop hello').hexdigest())],clock-100)
      emit(event)

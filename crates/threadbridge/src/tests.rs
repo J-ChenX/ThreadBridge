@@ -412,3 +412,36 @@ fn copy_deletion_survives_reopen_and_cannot_resurrect_or_redispatch() {
         reopened.events(0).unwrap()["collection_generation"]
     );
 }
+#[test]
+fn private_backup_copy_keeps_credentials_and_rejects_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("credential.json");
+    let dest = dir.path().join("bundle");
+    std::fs::write(&source, b"synthetic credential").unwrap();
+    crate::private_directory(&dest).unwrap();
+    crate::copy_private(&source, &dest.join("credential.json")).unwrap();
+    assert_eq!(
+        std::fs::read(dest.join("credential.json")).unwrap(),
+        b"synthetic credential"
+    );
+    assert!(crate::copy_private(&source, &dest.join("credential.json")).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dest.join("credential.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(source, &link).unwrap();
+        assert!(crate::copy_private(&link, &dest.join("link")).is_err());
+    }
+}

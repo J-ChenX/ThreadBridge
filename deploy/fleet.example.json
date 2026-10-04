@@ -6,8 +6,8 @@
     "workstation": {
       "ssh": "operator@100.64.0.10",
       "platform": "linux",
-      "python": "/usr/bin/python3",
-      "helper": "/home/operator/.local/lib/threadbridge/fleet/remote_capture.py",
+      "helper": "/home/operator/.local/lib/threadbridge/fleet/threadbridge",
+      "remote_binary": "/path/to/linux/threadbridge",
       "codex_home": "/home/operator/.codex",
       "codex": "/path/to/codex",
       "host_id": "independently-registered-agent-id",

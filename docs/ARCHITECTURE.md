@@ -1,5 +1,11 @@
 # ThreadBridge 架构入口
 
+## 实现与兼容
+
+生产采集、当前轮次用户输入、collection 策略与健康状态、跨机固定 RPC 和 resume 工作器由同一 Rust CLI 实现。SQLite 表、原生身份、health 双槽、策略文件及未知请求不重投的约束保持兼容。单元回归与实现同属 Rust；Python 保留独立回环集成、Android 工具和两个旧路径启动器。
+
+Python 旧运行链路的恢复来源为 Git `c39a2c5`。部署切换前先构建匹配目标平台的原生二进制，核对 notify 和 systemd 入口；不运行真实清理或发送来验证迁移。发生回退时恢复同一版本的程序与配置，保留最新策略、墓碑和发送账本。
+
 [产品约束](产品约束.md)定义预期行为。本文描述当前源码结构，模块文档定义具体合同。旧原型和逐轮部署记录不属于公开接入合同。
 
 ## 模块与数据流
@@ -10,7 +16,7 @@ flowchart LR
     Hub --> Notify[ntfy 轻量通知]
     Local[完成捕获与用户轮次读取] --> Capture[(独立捕获库)]
     Capture -->|capture-sync / capture-bridge| Hub
-    Remote[远端固定 Python RPC] <-->|认证 SSH / Tailscale| Fleet[多机采集与队列代理]
+    Remote[远端固定 Rust RPC] <-->|认证 SSH / Tailscale| Fleet[多机采集与队列代理]
     Fleet --> Capture
     Hub <-->|WSS 或进程内调用| Agent[Rust Agent]
     Agent --> Adapter[现有 App Server proxy 适配器]
@@ -22,14 +28,14 @@ flowchart LR
 | M01 Android | `android/app/src/` | [Android 客户端](modules/Android客户端.md) |
 | M02 Hub | `crates/threadbridge/src/hub.rs`、`store.rs` | [通信与存储](modules/通信与存储.md) |
 | M03 Agent | `crates/threadbridge/src/agent.rs` | 持久发送意图，主动 WSS 或合并运行 |
-| M04 Adapter / Capture | `adapter.rs`、`probe.rs`、`capture.rs`、`queue.rs`、`scripts/capture_*.py` | [Codex 接入](modules/Codex接入.md) |
+| M04 Adapter / Capture | `adapter.rs`、`probe.rs`、`capture.rs`、`queue.rs`、`native_capture.rs`、`native_input.rs`、`native_resume.rs` | [Codex 接入](modules/Codex接入.md) |
 | M05 Protocol | `crates/threadbridge/src/model.rs` | 版本 1，身份和大小白名单 |
 | M06 Notification | `crates/threadbridge/src/notify.rs` | 持久 outbox、有效期和有界重试 |
-| M07 Operations | `main.rs`、`scripts/`、`deploy/` | [运行与安装](运行与安装.md)、[多机接入](多机接入.md) |
+| M07 Operations | `main.rs`、`collection.rs`、`health.rs`、`native_fleet.rs`、`native_remote.rs`、`native_recovery.rs`、`collection_reset.rs`、`deploy/` | [运行与安装](运行与安装.md)、[多机接入](多机接入.md) |
 
 Hub 的命令账本、事件游标和通知 outbox 使用 SQLite WAL/FULL；手机 Room 为离线 UI 数据源；原 Codex 对话是原始正文和轮次的来源，ThreadBridge 只持有副本。原生身份结合 host/profile/thread 派生业务键，标题不参与路由。
 
-正式 proxy Adapter 仅附着已有服务。默认手机续聊可走经过版本验证的桌面 queue；队列入列不等于开始执行。独立 `resume_dispatch.py` 是有租约和权限约束的候选入口，不能以手机普通配对自动获得执行许可。
+正式 proxy Adapter 仅附着已有服务。默认手机续聊可走经过版本验证的桌面 queue；队列入列不等于开始执行。独立 `threadbridge resume` 是有租约和权限约束的候选入口，不能以手机普通配对自动获得执行许可。
 
 ## 跨模块约束
 
@@ -38,7 +44,7 @@ Hub 的命令账本、事件游标和通知 outbox 使用 SQLite WAL/FULL；手�
 - 完成捕获独立于 Codex 运行；正文只在确定 final/completed 后保存。用户消息读取绑定当前 thread/turn。
 - collection 策略和删除 tombstone 阻止旧副本重新进入；手机 generation 切换保留配对并清除旧缓存。
 - 正文、网络帧、缓存、事件、队列及 SQLite 规模有界；超限明确失败。
-- Linux 服务与远端采集由原生服务管理器管理；脚本目录是通知配置和已部署服务的稳定入口。
+- Linux 服务与远端采集由原生服务管理器管理；旧脚本路径只转交原生 CLI；新部署直接配置二进制入口。
 
 ## 验证关口
 
@@ -53,4 +59,4 @@ observed：源码包含四机运维、完成回复独立落盘、用户消息同
 | G05 公网通知 | HTTPS 配置、outbox 重试、深链接 | TLS 信任边界、移动网络和锁屏 p95 |
 | G06 恢复 | WAL 一致性备份、只读恢复、撤销与重启测试 | 实际部署恢复、开机恢复及 24–72 小时运行 |
 
-构建和集成顺序为 Rust 单元/Clippy → release → Python 单元与回环集成 → Android JVM/Lint/构建 → 原签名升级校验 → 经明确配置的实机验收。模块合同与 schema 变更须同步维护当前文档；共享协议、锁文件和数据库迁移统一集成。
+构建和集成顺序为 Rust 单元/Clippy → release → Python 回环集成 → Android JVM/Lint/构建 → 原签名升级校验 → 经明确配置的实机验收。模块合同与 schema 变更须同步维护当前文档；共享协议、锁文件和数据库迁移统一集成。

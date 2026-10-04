@@ -4,8 +4,7 @@
 
 | 位置 | 范围 |
 |---|---|
-| `crates/threadbridge/src/` | Rust 协议、持久化、鉴权、发送恢复与隔离 proxy fixture |
-| `tests/python/` | 完成捕获、用户消息、健康、collection、多机与 resume 单元回归 |
+| `crates/threadbridge/src/` | Rust 协议、持久化、鉴权、采集、用户轮次、collection、健康、跨机/恢复、resume 与隔离 fixture |
 | `tests/integration/` | 真实回环 HTTP/WS、queue/resume mock、独立收件、关联和重启 |
 | `tests/fixtures/` | Rust 子进程测试共用的固定 mock CLI；每个测试单独保存配置和调用记录 |
 | `android/app/src/test/` | Android JVM 同步与显示策略 |
@@ -19,7 +18,7 @@ python3 tests/run.py --unit-only
 python3 tests/run.py --integration-only --binary target/release/threadbridge
 ```
 
-CI 在 Python 3.10 与 3.14 分别执行完整回归。捕获 CLI 和 mock 子进程使用当前解释器，而非固定 `/usr/bin/python3`；部署机的 Python 路径仍由其服务配置决定。
+CI 在 Python 3.10 与 3.14 分别执行完整回归。集成测试调用原生 capture/resume CLI；mock 子进程使用所选 Python。Rust 模块单元测试在 Linux/Windows 运行，发送和进程所有权 fixture 只使用隔离模拟器，未证明任意真实 Codex 或四机长期运行。
 
 installed proxy 的 Rust fixture 默认忽略，它依赖本机 Codex CLI；单独运行仍只操作隔离 socket。常规 CI 不依赖该 CLI。
 

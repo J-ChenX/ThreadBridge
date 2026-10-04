@@ -2,7 +2,13 @@
 from contextlib import closing
 import hashlib,json,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
 from pathlib import Path
-from capture_user_turn import save_turn
+def save_turn(database,native,turn,rows,completed_at):
+ # Synthetic source fixture only; production user-turn parsing is tested in Rust.
+ with closing(sqlite3.connect(database)) as c, c:
+  c.execute('CREATE TABLE IF NOT EXISTS captured_user_messages(thread_id TEXT,turn_id TEXT,message_id TEXT,text TEXT,created_at INTEGER,input_digest TEXT,PRIMARY KEY(thread_id,message_id))')
+  c.execute('CREATE TABLE IF NOT EXISTS captured_turn_order(thread_id TEXT,turn_id TEXT,completed_at INTEGER,PRIMARY KEY(thread_id,turn_id))')
+  c.execute('INSERT OR IGNORE INTO captured_turn_order VALUES(?,?,?)',(native,turn,completed_at))
+  c.executemany('INSERT OR IGNORE INTO captured_user_messages VALUES(?,?,?,?,?,?)',[(native,turn,*row) for row in rows])
 N='00000000-0000-4000-8000-000000000001';A='ffffffff-ffff-4fff-8fff-ffffffffffff';B='00000000-0000-4000-8000-000000000002'
 def run(binary,mode):
  with tempfile.TemporaryDirectory() as temp:
