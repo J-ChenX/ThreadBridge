@@ -286,12 +286,14 @@ fn start_notifications(db: Store, url: String) -> Result<()> {
     Ok(())
 }
 fn private_directory(path: &std::path::Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(path)?;
     Ok(())
 }
@@ -410,7 +412,10 @@ async fn main() -> Result<()> {
                 }
             }
             #[cfg(not(unix))]
-            anyhow::bail!("Unix probe unavailable on this platform");
+            {
+                let _ = (socket, thread);
+                anyhow::bail!("Unix probe unavailable on this platform");
+            }
         }
         Commands::Hub {
             db,

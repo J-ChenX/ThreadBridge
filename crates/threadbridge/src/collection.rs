@@ -36,6 +36,8 @@ pub fn suffix(path: &Path, extra: &str) -> PathBuf {
     s.into()
 }
 pub fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     File::open(
         path.parent()
