@@ -1,4 +1,5 @@
-import json,sqlite3,tempfile,unittest,uuid,os,subprocess
+from contextlib import closing
+import json,sqlite3,tempfile,unittest,uuid,os,subprocess,sys
 from pathlib import Path
 from unittest.mock import patch
 from capture_completion import capture,MAX_REPLY_BYTES
@@ -10,15 +11,15 @@ class DurableCaptureTests(unittest.TestCase):
   self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup);self.db=Path(self.temp.name)/'capture.sqlite';self.event={'type':'agent-turn-complete','thread-id':T,'turn-id':U,'last-assistant-message':'complete final','input-messages':['NEVER STORE'],'cwd':'NEVER STORE'}
  def save(self,**kw):return capture(json.dumps(self.event),T,self.db,**kw)
  def test_long_term_rows_and_bytes_have_no_test_budget(self):
-  with sqlite3.connect(self.db) as c:
+  with closing(sqlite3.connect(self.db)) as c, c:
    c.execute('CREATE TABLE captured_replies(thread_id TEXT,turn_id TEXT,reply TEXT,utf8_bytes INTEGER,captured_at INTEGER,PRIMARY KEY(thread_id,turn_id))')
    c.executemany('INSERT INTO captured_replies VALUES(?,?,?,?,?)',[(T,str(uuid.uuid4()),'x'*17000,17000,1) for _ in range(1001)])
   self.assertEqual(self.save(),'captured')
-  with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('SELECT count(*),sum(utf8_bytes) FROM captured_replies').fetchone(),(1002,17017000+14))
+  with closing(sqlite3.connect(self.db)) as c, c:self.assertEqual(c.execute('SELECT count(*),sum(utf8_bytes) FROM captured_replies').fetchone(),(1002,17017000+14))
  def test_budget_failure_is_durable_and_original_event_retry_resolves(self):
   with self.assertRaisesRegex(ValueError,'budget'):self.save(storage_budget=1)
   self.assertEqual(read_health(self.db)['failures'][T+':'+U]['reason'],'storage_budget_exceeded')
-  with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],0)
+  with closing(sqlite3.connect(self.db)) as c, c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],0)
   self.assertEqual(self.save(),'captured');self.assertEqual(self.save(),'duplicate');self.assertEqual(read_health(self.db)['failures'],{})
   self.assertNotIn(b'NEVER STORE',self.db.read_bytes());self.assertNotIn(b'complete final',health_path(self.db).read_bytes())
  def test_disk_guard_preserves_prior_reply_and_failure_status(self):
@@ -27,7 +28,7 @@ class DurableCaptureTests(unittest.TestCase):
    usage.return_value.free=0
    with self.assertRaisesRegex(ValueError,'disk_space_low'):self.save()
   state=read_health(self.db);self.assertEqual(next(iter(state['failures'].values()))['reason'],'disk_space_low')
-  with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],1)
+  with closing(sqlite3.connect(self.db)) as c, c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],1)
  def test_storage_failure_is_generic_and_intent_survives_restart(self):
   with patch('capture_completion.capture_record',side_effect=sqlite3.OperationalError('PRIVATE SQL ERROR')):
    with self.assertRaises(sqlite3.OperationalError):self.save()
@@ -53,8 +54,8 @@ class DurableCaptureTests(unittest.TestCase):
   update_health(self.db,T,U,'conflicting_reply','second')
   update_health(self.db,T,U,None,'first')
   self.assertEqual(next(iter(read_health(self.db)['failures'].values()))['reason'],'conflicting_reply')
- def test_actual_usr_bin_python_catalog_cli(self):
-  script=Path(__file__).resolve().parents[2] / 'scripts/capture_catalog.py';argv=['/usr/bin/python3',str(script),'--all-tasks','--database',str(self.db),'--storage-budget-bytes','1',json.dumps(self.event)]
+ def test_selected_python_catalog_cli(self):
+  script=Path(__file__).resolve().parents[2] / 'scripts/capture_catalog.py';argv=[sys.executable,str(script),'--all-tasks','--database',str(self.db),'--storage-budget-bytes','1',json.dumps(self.event)]
   first=subprocess.run(argv,text=True,capture_output=True);self.assertEqual(first.returncode,2);self.assertNotIn('complete final',first.stderr)
   state=read_health(self.db);self.assertEqual(next(iter(state['failures'].values()))['reason'],'storage_budget_exceeded')
   argv=argv[:-3]+[json.dumps(self.event)]

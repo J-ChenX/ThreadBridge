@@ -3,6 +3,7 @@
 The notify input-messages array can contain previous turns and system context;
 never treat it as the current human message. Opt-in through --user-turn-index.
 """
+from contextlib import closing
 import hashlib,json,re,sqlite3,uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ MARKER=re.compile(r'\A\[ThreadBridge request:([0-9a-f-]{36})\]\n')
 
 def read_turn(index,native,turn):
     uuid.UUID(native);uuid.UUID(turn)
-    with sqlite3.connect('file:'+str(Path(index).resolve())+'?mode=ro',uri=True,timeout=3) as c:
+    with closing(sqlite3.connect('file:'+str(Path(index).resolve())+'?mode=ro',uri=True,timeout=3)) as c, c:
         row=c.execute('SELECT rollout_path FROM threads WHERE id=?',(native,)).fetchone()
     if not row:raise ValueError('user_turn_source_missing')
     result=[];used=0;identity=False;complete=False
@@ -46,7 +47,7 @@ def read_turn(index,native,turn):
     return result,completed_at
 
 def save_turn(database,native,turn,rows,completed_at):
-    with sqlite3.connect(database,timeout=3) as c:
+    with closing(sqlite3.connect(database,timeout=3)) as c, c:
         c.execute('PRAGMA synchronous=FULL')
         c.execute('CREATE TABLE IF NOT EXISTS captured_user_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,input_digest TEXT NOT NULL,PRIMARY KEY(thread_id,message_id))')
         c.execute('CREATE TABLE IF NOT EXISTS captured_turn_order(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(thread_id,turn_id))')

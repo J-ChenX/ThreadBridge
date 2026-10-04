@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Temporary loopback Hub, synthetic phone and mock CLI only; no real sends."""
+from contextlib import closing
 import hashlib,json,os,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
 from capture_user_turn import save_turn
 from pathlib import Path
@@ -14,16 +15,16 @@ def main():
      root=Path(tmp);db=root/'hub.sqlite';capture=root/'capture.sqlite';calls=root/'calls';mode=root/'mode';mode.write_text('ack')
      env={'PATH':'/usr/bin:/bin','HOME':str(root)}
      event={'thread-id':thread,'turn-id':turn,'type':'agent-turn-complete','last-assistant-message':'baseline'}
-     def emit(e):subprocess.run(['/usr/bin/python3',receiver,'--thread',e['thread-id'],'--database',capture,json.dumps(e)],check=True,stdout=subprocess.DEVNULL,env=env)
+     def emit(e):subprocess.run([sys.executable,receiver,'--thread',e['thread-id'],'--database',capture,json.dumps(e)],check=True,stdout=subprocess.DEVNULL,env=env)
      clock=int(time.time())*1000
      save_turn(capture,thread,turn,[('desktop-input','desktop hello',clock-500,hashlib.sha256(b'desktop hello').hexdigest())],clock-100)
      emit(event)
-     with sqlite3.connect(db) as c:
+     with closing(sqlite3.connect(db)) as c, c:
       c.execute('CREATE TABLE devices(id TEXT PRIMARY KEY,token TEXT UNIQUE,role TEXT NOT NULL,name TEXT NOT NULL,expires INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,last_seen INTEGER NOT NULL DEFAULT 0)')
       c.execute("INSERT INTO devices(id,role,name,expires) VALUES('host','agent','fixture',?)",(int(time.time())+300,))
       c.execute("INSERT INTO devices(id,token,role,name,expires) VALUES('phone',?,'phone','fixture',?)",(hashlib.sha256(b'fixture-phone').hexdigest(),int(time.time())+300))
      fake=root/'mock-codex'
-     fake.write_text(f"""#!/usr/bin/python3
+     fake.write_text(f"""#!{sys.executable}
 import json,sys
 from pathlib import Path
 if sys.argv[1]=='--version':
@@ -80,7 +81,7 @@ else:print('uncertain')
       assert len(calls.read_text().splitlines())==2
       assert api('/v1/commands/'+cmd2)['status']=='unknown'
       assert api('/v1/threads/'+tid+'/messages')['messages']==msgs
-      with sqlite3.connect(db) as c:assert c.execute('SELECT count(*) FROM outbox').fetchone()[0]==0
+      with closing(sqlite3.connect(db)) as c, c:assert c.execute('SELECT count(*) FROM outbox').fetchone()[0]==0
       if all_threads:
        # A conversation created after worker startup must become writable without restart.
        emit(dict(event, **{'thread-id':thread2,'last-assistant-message':'second baseline'}))

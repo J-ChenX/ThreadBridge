@@ -1,4 +1,5 @@
 """Local synthetic phone UI data and fake receipts. Never invokes Codex."""
+from contextlib import closing
 import hashlib,json,os,sqlite3,subprocess,time,uuid
 from pathlib import Path
 root=Path(__file__).resolve().parents[2];directory=root/'local/ui-test-018';directory.mkdir(parents=True,exist_ok=True)
@@ -16,7 +17,7 @@ try:
  time.sleep(.1)
  host='ui-fixture-host';now=int(time.time());threads={};hosts=[('ui-fixture-host','echova'),('fixture-lerrem','lerrem'),('fixture-nix','nix'),('fixture-windows','Windows')]
  if fresh:
-  with sqlite3.connect(db) as c:
+  with closing(sqlite3.connect(db)) as c, c:
    for hid,name in hosts:
     c.execute("INSERT INTO devices(id,role,name,expires,last_seen) VALUES(?,'agent',?,?,?)",(hid,name,now+86400,now))
     c.execute('INSERT INTO capture_health VALUES(?,?,?)',(hid,json.dumps({'failures':{}}),now))
@@ -37,7 +38,7 @@ try:
   (directory/'threads.json').write_text(json.dumps(threads))
  print('synthetic UI fixture ready on loopback; pairing saved privately',flush=True)
  while True:
-  with sqlite3.connect(db,timeout=3) as c:
+  with closing(sqlite3.connect(db,timeout=3)) as c, c:
    now=int(time.time());c.execute("UPDATE devices SET last_seen=? WHERE role='agent'",(now,));[c.execute('INSERT OR REPLACE INTO capture_health VALUES(?,?,?)',(hid,json.dumps({'failures':{}}),now)) for hid,_ in hosts]
    for command,thread,payload in c.execute("SELECT id,thread,payload FROM commands WHERE status='accepted'").fetchall():
     text=json.loads(payload)['text'];turn=str(uuid.uuid4());reply='已收到 **'+text+'**。\n\n这是模拟器中的测试回复。'

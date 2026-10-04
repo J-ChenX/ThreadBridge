@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """No real Codex or phone: completion catalog -> independent PC inbox -> HTTP."""
+from contextlib import closing
 import hashlib,json,os,socket,sqlite3,subprocess,sys,tempfile,time,urllib.request,uuid
 from pathlib import Path
 def main():
@@ -13,8 +14,8 @@ def main():
      env={'PATH':'/usr/bin:/bin','HOME':str(root)}
      for i,native in enumerate(ids):
       event={'type':'agent-turn-complete','thread-id':native,'turn-id':native,'last-assistant-message':'saved final '+str(i),'input-messages':['PRIVATE INPUT'],'cwd':'PRIVATE PATH'}
-      subprocess.run(['/usr/bin/python3',receiver,*receiver_scope,'--database',capture,json.dumps(event)],env=env,check=True,stdout=subprocess.DEVNULL)
-     with sqlite3.connect(db) as c:
+      subprocess.run([sys.executable,receiver,*receiver_scope,'--database',capture,json.dumps(event)],env=env,check=True,stdout=subprocess.DEVNULL)
+     with closing(sqlite3.connect(db)) as c, c:
       c.execute('CREATE TABLE devices(id TEXT PRIMARY KEY,token TEXT UNIQUE,role TEXT NOT NULL,name TEXT NOT NULL,expires INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,last_seen INTEGER NOT NULL DEFAULT 0)')
       c.execute("INSERT INTO devices(id,role,name,expires) VALUES('host','agent','fixture',?)",(int(time.time())+300,))
       c.execute("INSERT INTO devices(id,token,role,name,expires) VALUES('phone',?,'phone','fixture',?)",(hashlib.sha256(b'fixture-phone').hexdigest(),int(time.time())+300))
@@ -47,7 +48,7 @@ def main():
       if all_mode:
        # Actual interpreter failure, polling visibility, exact event retry, duplicates.
        failed_event={'type':'agent-turn-complete','thread-id':ids[0],'turn-id':'00000000-0000-4000-8000-000000000013','last-assistant-message':'retry final'}
-       argv=['/usr/bin/python3',receiver,*receiver_scope,'--database',capture]
+       argv=[sys.executable,receiver,*receiver_scope,'--database',capture]
        failed=subprocess.run([*argv,'--storage-budget-bytes','1',json.dumps(failed_event)],env=env,capture_output=True);assert failed.returncode==2
        health=wait(lambda:api('/v1/capture-health')['hosts'][0]['status'] if api('/v1/capture-health')['hosts'] and api('/v1/capture-health')['hosts'][0]['status'].get('failures') else None)
        assert next(iter(health['failures'].values()))['reason']=='storage_budget_exceeded'
@@ -60,16 +61,16 @@ def main():
       # Stop projection/sending side entirely; only PC HTTP storage remains.
       sync.terminate();sync.wait(timeout=3);sync=None
       hub.terminate();hub.wait(timeout=3);hub=start()
-      with sqlite3.connect(db) as c:c.execute("UPDATE devices SET last_seen=0,expires=? WHERE id='host'",(int(time.time())-1,))
+      with closing(sqlite3.connect(db)) as c, c:c.execute("UPDATE devices SET last_seen=0,expires=? WHERE id='host'",(int(time.time())-1,))
       offline=api('/v1/threads')['threads'];assert len(offline)==2 and all(not r['host_online'] and not r['can_send'] for r in offline)
       assert all(len(api('/v1/threads/'+r['id']+'/messages')['messages'])==(2 if all_mode and r['native_id']==ids[0] else 1) for r in offline)
       # Same-title selection is ID-bound; no executable is invoked.
-      with sqlite3.connect(db) as c:
+      with closing(sqlite3.connect(db)) as c, c:
        c.execute("UPDATE devices SET last_seen=?,expires=? WHERE id='host'",(int(time.time()),int(time.time())+300))
        c.execute('UPDATE capture_targets SET queue_enabled=1,last_seen=?',(int(time.time()),));c.execute("UPDATE threads SET can_send=1,status='queue_ready'")
       chosen=next(r for r in api('/v1/threads')['threads'] if r['native_id']==ids[1])
       command=api('/v1/commands',{'request_id':str(uuid.uuid4()),'thread_id':chosen['id'],'text':'explicit mock selection','expected_revision':chosen['revision'],'created_at':int(time.time()),'kind':'send'})
-      with sqlite3.connect(db) as c:
+      with closing(sqlite3.connect(db)) as c, c:
        payload=json.loads(c.execute('SELECT payload FROM commands WHERE id=?',(command['id'],)).fetchone()[0]);assert payload['native_id']==ids[1] and payload['thread_id']==chosen['id']
        assert c.execute('SELECT count(*) FROM capture_queue_ledger').fetchone()[0]==0
        assert c.execute('SELECT count(*) FROM outbox').fetchone()[0]==0

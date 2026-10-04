@@ -1,4 +1,5 @@
 """Native UI QA against the isolated 8798 fixture; no real Codex messages."""
+from contextlib import closing
 import json,re,sqlite3,subprocess,time,uuid,xml.etree.ElementTree as ET
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2];ADB=ROOT/'local/android-sdk/platform-tools/adb';DIR=ROOT/'local/ui-test-018';ART=ROOT/'artifacts';threads=json.loads((DIR/'threads.json').read_text())
@@ -31,7 +32,7 @@ def main():
  tap(find(n,desc='更多选项'));n=wait(lambda n:'回到最新消息' in texts(n));assert '查看更早消息' in texts(n);assert '同步对话' in texts(n);shot('ui-0.1.8-menu.png');tap(find(n,text='回到最新消息'));print('top menu includes former composer actions',flush=True)
  n=ui();tap(find(n,desc='打开对话列表'));n=wait(lambda n:'连接与设置' in texts(n));tap(find(n,text='echova'));n=wait(lambda n:'nix' in texts(n) and 'Windows' in texts(n));assert '优化手机端显示' not in texts(n);shot('ui-0.1.8-drawer.png');print('four device groups and folding',flush=True)
  longpress(find(n,text='整理今天的想法'));n=wait(lambda n:'删除对话' in texts(n));shot('ui-0.1.8-longpress.png');tap(find(n,text='删除对话'));n=wait(lambda n:'删除这个对话？' in texts(n));assert '电脑 Codex 中的原始对话会保留' in texts(n);tap(find(n,text='删除'));n=wait(lambda n:'整理今天的想法' not in texts(n));
- with sqlite3.connect(DIR/'hub.sqlite') as db:
+ with closing(sqlite3.connect(DIR/'hub.sqlite')) as db, db:
   assert db.execute('SELECT count(*) FROM threads WHERE id=?',(threads['lerrem'],)).fetchone()[0]==0
   assert db.execute("SELECT count(*) FROM tombstones WHERE thread=? AND message=''",(threads['lerrem'],)).fetchone()[0]==1
  call('shell','am','force-stop','dev.threadbridge');call('shell','am','start','-n','dev.threadbridge/.MainActivity');n=wait(lambda n:'你的设备' in texts(n));assert '整理今天的想法' not in texts(n);print('long-press copy deletion persists',flush=True)

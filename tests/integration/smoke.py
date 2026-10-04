@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Real loopback HTTP + WebSocket + SQLite test; never connects to Codex."""
+from contextlib import closing
 import json, pathlib, socket, subprocess, tempfile, time, uuid, urllib.request, urllib.error, sys, base64, os, struct, sqlite3, hashlib
 binary = pathlib.Path(sys.argv[1] if len(sys.argv)>1 else 'target/release/threadbridge').resolve()
 opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -9,7 +10,8 @@ def request(base,path,token=None,data=None):
     req=urllib.request.Request(base+path,headers=headers,data=json.dumps(data).encode() if data is not None else None)
     try:
         with opener.open(req,timeout=5) as r:return r.status,json.load(r)
-    except urllib.error.HTTPError as e:return e.code,json.load(e)
+    except urllib.error.HTTPError as e:
+        with e:return e.code,json.load(e)
 class EventSocket:
     """Minimal read-only RFC6455 client for this loopback test; standard library only."""
     def __init__(self, port, token, after=0):
@@ -80,9 +82,9 @@ with tempfile.TemporaryDirectory(prefix='threadbridge-smoke-') as tmp:
         events_ws.close()
         # Old authoritative receipt beyond the most recent 128 rows must reconcile.
         agent.terminate();agent.wait(timeout=5)
-        with sqlite3.connect(db) as c:
+        with closing(sqlite3.connect(db)) as c, c:
             c.execute("UPDATE commands SET status='unknown',native_turn=NULL WHERE id=?",(accepted['id'],))
-        with sqlite3.connect(root/'agent.sqlite') as c:
+        with closing(sqlite3.connect(root/'agent.sqlite')) as c, c:
             c.executemany("INSERT INTO agent_ledger(id,status) VALUES(?,'rejected')",[(str(uuid.uuid4()),) for _ in range(140)])
         agent=subprocess.Popen([binary,'agent','--config',cfg,'--db',root/'agent.sqlite','--demo'],stdout=log,stderr=log)
         eventually(lambda:request(base,'/v1/commands/'+payload['request_id'],token)[1]['status']=='codex_accepted')
@@ -94,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix='threadbridge-smoke-') as tmp:
         agent=subprocess.Popen([binary,'agent','--config',cfg,'--db',root/'agent.sqlite','--demo'],stdout=log,stderr=log)
         eventually(lambda:request(base,'/v1/threads',token)[1]['threads'][0]['host_online'])
         assert request(base,'/v1/commands/'+payload['request_id'],token)[1]['native_turn_id']==receipt['native_turn_id']
-        with sqlite3.connect(root/'agent.sqlite') as c:
+        with closing(sqlite3.connect(root/'agent.sqlite')) as c, c:
             assert c.execute("SELECT count(*) FROM agent_ledger WHERE id=?",(accepted['id'],)).fetchone()[0]==1
 
         messages=eventually(lambda: any('中文 round trip' in m['text'] for m in request(base,f"/v1/threads/{thread['id']}/messages",token)[1]['messages']))
@@ -102,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix='threadbridge-smoke-') as tmp:
         subprocess.run([binary,'backup','--db',db,'--output',root/'backup.sqlite'],check=True,stdout=subprocess.DEVNULL)
         subprocess.run([binary,'restore','--backup',root/'backup.sqlite','--destination',root/'restored.sqlite'],check=True,stdout=subprocess.DEVNULL)
         import sqlite3
-        with sqlite3.connect(root/'restored.sqlite') as c:
+        with closing(sqlite3.connect(root/'restored.sqlite')) as c, c:
             assert c.execute("SELECT v FROM settings WHERE k='writes'").fetchone()[0]=='off'
             assert c.execute('SELECT count(*) FROM devices WHERE revoked=0').fetchone()[0]==0
         subprocess.run([binary,'revoke','--db',db,'--device',phone],check=True)

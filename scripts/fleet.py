@@ -122,7 +122,7 @@ def validate_snapshot(raw, destination, prefix):
     temp = destination.with_suffix('.download')
     atomic(temp, data)
     try:
-        with sqlite3.connect(temp.as_uri() + '?mode=rw', uri=True) as db:
+        with closing(sqlite3.connect(temp.as_uri() + '?mode=rw', uri=True)) as db, db:
             db.execute('PRAGMA journal_mode=DELETE')
             if db.execute('PRAGMA quick_check').fetchone() != ('ok',): raise ValueError('snapshot_corrupt')
             required = {'captured_replies','captured_user_messages','captured_turn_order','captured_request_ids'}
@@ -140,7 +140,7 @@ def validate_snapshot(raw, destination, prefix):
 
 def offline(c, host):
     # 仅更新该主机就绪/心跳，不触碰其不可变发送账本。
-    with sqlite3.connect(c['hub_db'], timeout=3) as db:
+    with closing(sqlite3.connect(c['hub_db'], timeout=3)) as db, db:
         db.execute('UPDATE devices SET last_seen=0 WHERE id=?', (host['host_id'],))
         db.execute('UPDATE capture_targets SET queue_enabled=0,last_seen=0 WHERE host=?', (host['host_id'],))
         db.execute('UPDATE threads SET can_send=0 WHERE host=?', (host['host_id'],))
@@ -158,7 +158,7 @@ def queue_snapshot(source,destination,blocked):
 
 
 def quarantine(c,host,blocked):
-    with sqlite3.connect(c['hub_db'],timeout=3) as db:
+    with closing(sqlite3.connect(c['hub_db'],timeout=3)) as db, db:
         for native in blocked:
             db.execute('UPDATE capture_targets SET queue_enabled=0,last_seen=0 WHERE host=? AND native=?',(host['host_id'],native))
             db.execute('UPDATE threads SET can_send=0 WHERE host=? AND native=?',(host['host_id'],native))
@@ -183,7 +183,7 @@ def run_host(c, name, config_path):
         while not stopping:
             started = time.monotonic()
             try:
-                with sqlite3.connect(c['hub_db'],timeout=3) as db:
+                with closing(sqlite3.connect(c['hub_db'],timeout=3)) as db, db:
                     excluded=[r[0] for r in db.execute("SELECT native FROM capture_targets ct JOIN tombstones t ON t.thread=ct.thread AND t.message='' WHERE ct.host=?",(host['host_id'],))]
                     local_host=next(h['host_id'] for h in c['hosts'].values() if h.get('local'))
                     local_excluded=[r[0] for r in db.execute("SELECT native FROM capture_targets ct JOIN tombstones t ON t.thread=ct.thread AND t.message='' WHERE ct.host=?",(local_host,))]
@@ -252,7 +252,7 @@ def install(c, config_path):
     units = Path.home()/'.config/systemd/user'; units.mkdir(parents=True, exist_ok=True)
     backup = ROOT/'local/backups'/('fleet-'+time.strftime('%Y%m%dT%H%M%S'))
     backup.mkdir(parents=True, exist_ok=False, mode=0o700)
-    with sqlite3.connect(c['hub_db']) as source, sqlite3.connect(backup/'hub.sqlite') as target: source.backup(target)
+    with closing(sqlite3.connect(c['hub_db'])) as source, source, closing(sqlite3.connect(backup/'hub.sqlite')) as target, target: source.backup(target)
     for unit in LOCAL_UNITS+['threadbridge.target','threadbridge-remote@.service']:
         if (units/unit).exists(): shutil.copy2(units/unit,backup/unit)
         if (units/(unit+'.d')).exists(): shutil.copytree(units/(unit+'.d'),backup/(unit+'.d'))

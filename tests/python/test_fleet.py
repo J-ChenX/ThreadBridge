@@ -1,4 +1,5 @@
 """有界四机捕获与 SSH RPC 的隔离合同测试，不连接真实设备。"""
+from contextlib import closing
 import base64
 import json
 import io
@@ -27,7 +28,7 @@ class FleetTest(unittest.TestCase):
         self.root=Path(self.tmp.name); self.home=self.root/'.codex'; self.home.mkdir()
         self.native=str(uuid.uuid4()); self.path=self.home/'sessions'/'session.jsonl'; self.path.parent.mkdir()
         self.index=self.home/'state_5.sqlite'; self.database=self.root/'data'/'replies.sqlite'
-        with sqlite3.connect(self.index) as c:
+        with closing(sqlite3.connect(self.index)) as c, c:
             c.execute('CREATE TABLE threads(id TEXT,rollout_path TEXT,title TEXT,updated_at INTEGER)')
             c.execute('INSERT INTO threads VALUES(?,?,?,?)',(self.native,str(self.path),'测试对话',1))
         self.path.write_text(json.dumps({'type':'session_meta','payload':{'id':self.native}})+'\n')
@@ -51,10 +52,10 @@ class FleetTest(unittest.TestCase):
 
     def test_latest_seed_then_new_turns_idempotent_and_human_order(self):
         old=self.append(); latest=self.append('最新用户'); remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as c:
+        with closing(sqlite3.connect(self.database)) as c, c:
             self.assertEqual(c.execute('SELECT turn_id FROM captured_replies').fetchall(),[(latest,)])
         third=self.append('a; $(shell) `quoted`\n中文'); remote.poll(self.config,self.database); remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as c:
+        with closing(sqlite3.connect(self.database)) as c, c:
             self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],2)
             self.assertEqual(c.execute('SELECT text FROM captured_user_messages WHERE turn_id=?',(third,)).fetchone()[0],'a; $(shell) `quoted`\n中文')
             self.assertNotIn('过程不应同步',str(c.execute('SELECT reply FROM captured_replies').fetchall()))
@@ -92,18 +93,18 @@ class FleetTest(unittest.TestCase):
             self.assertEqual(queue.call_args.args[1][-1],'--message=--config=evil')
         destination=self.root/'queue.sqlite'
         fleet.queue_snapshot(self.database,destination,[self.native])
-        with sqlite3.connect(destination) as c:
+        with closing(sqlite3.connect(destination)) as c, c:
             for table in ('captured_replies','captured_user_messages','captured_turn_order','captured_request_ids'):
                 self.assertEqual(c.execute('SELECT count(*) FROM '+table).fetchone()[0],0)
-        with sqlite3.connect(self.database) as c:
+        with closing(sqlite3.connect(self.database)) as c, c:
             self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],1)
 
     def test_quarantine_keeps_other_threads_and_ledger(self):
         hub=self.root/'hub.sqlite'
-        with sqlite3.connect(hub) as c:
+        with closing(sqlite3.connect(hub)) as c, c:
             c.executescript("CREATE TABLE capture_targets(host,native,queue_enabled,last_seen);CREATE TABLE threads(host,native,can_send);CREATE TABLE commands(id,status);INSERT INTO capture_targets VALUES('host','bad',1,10),('host','good',1,10);INSERT INTO threads VALUES('host','bad',1),('host','good',1);INSERT INTO commands VALUES('sent','unknown');")
         fleet.quarantine({'hub_db':str(hub)},{'host_id':'host'},['bad'])
-        with sqlite3.connect(hub) as c:
+        with closing(sqlite3.connect(hub)) as c, c:
             self.assertEqual(c.execute('SELECT native,can_send FROM threads ORDER BY native').fetchall(),[('bad',0),('good',1)])
             self.assertEqual(c.execute('SELECT status FROM commands').fetchone()[0],'unknown')
 
@@ -125,12 +126,12 @@ class FleetTest(unittest.TestCase):
     def test_snapshot_validate_before_replace_and_prefix(self):
         self.append();remote.poll(self.config,self.database)
         backup=self.root/'backup.sqlite'
-        with sqlite3.connect(self.database) as source,sqlite3.connect(backup) as target:source.backup(target)
+        with closing(sqlite3.connect(self.database)) as source, source,closing(sqlite3.connect(backup)) as target, target:source.backup(target)
         destination=self.root/'phone.sqlite'; destination.write_bytes(b'previous')
         with self.assertRaises(Exception):fleet.validate_snapshot(base64.b64encode(zlib.compress(b'invalid')).decode(),destination,'host')
         self.assertEqual(destination.read_bytes(),b'previous')
         fleet.validate_snapshot(base64.b64encode(zlib.compress(backup.read_bytes())).decode(),destination,'host')
-        with sqlite3.connect(destination) as c:self.assertEqual(c.execute('SELECT title FROM captured_replies').fetchone()[0],'host · 测试对话')
+        with closing(sqlite3.connect(destination)) as c, c:self.assertEqual(c.execute('SELECT title FROM captured_replies').fetchone()[0],'host · 测试对话')
 
     def test_snapshot_expansion_limit(self):
         data=base64.b64encode(zlib.compress(b'a'*(32*1024*1024+1))).decode()
@@ -138,10 +139,10 @@ class FleetTest(unittest.TestCase):
 
     def test_offline_keeps_immutable_ledger(self):
         hub=self.root/'hub.sqlite'
-        with sqlite3.connect(hub) as c:
+        with closing(sqlite3.connect(hub)) as c, c:
             c.executescript("CREATE TABLE devices(id,last_seen);CREATE TABLE capture_targets(host,queue_enabled,last_seen);CREATE TABLE threads(host,can_send);CREATE TABLE commands(id,status);INSERT INTO devices VALUES('host',10);INSERT INTO capture_targets VALUES('host',1,10);INSERT INTO threads VALUES('host',1);INSERT INTO commands VALUES('sent','unknown');")
         fleet.offline({'hub_db':str(hub)},{'host_id':'host'})
-        with sqlite3.connect(hub) as c:
+        with closing(sqlite3.connect(hub)) as c, c:
             self.assertEqual(c.execute('SELECT can_send FROM threads').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT status FROM commands').fetchone()[0],'unknown')
 
@@ -165,18 +166,18 @@ class FleetTest(unittest.TestCase):
         with patch.object(remote,'TAIL_BYTES',4096):remote.poll(self.config,self.database)
         cache=json.loads((self.database.parent/'poll.json').read_text())
         self.assertEqual(cache[self.native]['turn_id'],first)
-        with sqlite3.connect(self.database) as c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],1)
+        with closing(sqlite3.connect(self.database)) as c, c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],1)
         self.assertTrue(capture_health.read_health(self.database)['failures'])
 
     def test_watermark_survives_discovery_window_absence(self):
         first=self.append();remote.poll(self.config,self.database)
-        with sqlite3.connect(self.index) as c:c.execute('DELETE FROM threads')
+        with closing(sqlite3.connect(self.index)) as c, c:c.execute('DELETE FROM threads')
         remote.poll(self.config,self.database)
         self.assertEqual(json.loads((self.database.parent/'poll.json').read_text())[self.native]['turn_id'],first)
         self.append();self.append()
-        with sqlite3.connect(self.index) as c:c.execute('INSERT INTO threads VALUES(?,?,?,1)',(self.native,str(self.path),'测试'))
+        with closing(sqlite3.connect(self.index)) as c, c:c.execute('INSERT INTO threads VALUES(?,?,?,1)',(self.native,str(self.path),'测试'))
         remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],3)
+        with closing(sqlite3.connect(self.database)) as c, c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],3)
 
     def test_equal_or_reversed_timestamps_do_not_lose_turns(self):
         self.append();remote.poll(self.config,self.database)
@@ -187,7 +188,7 @@ class FleetTest(unittest.TestCase):
                 line['timestamp']='2023-11-14T22:13:20Z'
         self.path.write_text(''.join(json.dumps(line)+'\n' for line in lines))
         remote.poll(self.config,self.database);remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],3)
+        with closing(sqlite3.connect(self.database)) as c, c:self.assertEqual(c.execute('SELECT count(*) FROM captured_replies').fetchone()[0],3)
 
     def test_impossible_capture_budget_is_visible_and_cools_down(self):
         self.append()
@@ -268,12 +269,12 @@ class FleetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'source_changed'):recovery.finalize(self.database,directory)
         other=recovery.prepare(self.config,self.database,str(uuid.uuid4()))
         recovery.batch(self.config,self.database,other)
-        with sqlite3.connect(self.index) as db:db.execute('INSERT INTO threads VALUES(?,?,?,99)',(str(uuid.uuid4()),str(self.path),'new'))
+        with closing(sqlite3.connect(self.index)) as db, db:db.execute('INSERT INTO threads VALUES(?,?,?,99)',(str(uuid.uuid4()),str(self.path),'new'))
         with self.assertRaisesRegex(ValueError,'index_changed'):recovery.finalize(self.database,other)
 
     def test_recovery_keeps_partial_turn_records_quarantined(self):
         self.append();remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as db:
+        with closing(sqlite3.connect(self.database)) as db, db:
             db.execute('INSERT INTO captured_turn_order VALUES(?,?,?)',(self.native,str(uuid.uuid4()),1))
         directory=recovery.prepare(self.config,self.database,str(uuid.uuid4()))
         recovery.batch(self.config,self.database,directory)
@@ -282,7 +283,7 @@ class FleetTest(unittest.TestCase):
 
     def test_recovery_keeps_missing_human_quarantined(self):
         self.append();remote.poll(self.config,self.database)
-        with sqlite3.connect(self.database) as db:db.execute('DELETE FROM captured_user_messages')
+        with closing(sqlite3.connect(self.database)) as db, db:db.execute('DELETE FROM captured_user_messages')
         directory=recovery.prepare(self.config,self.database,str(uuid.uuid4()))
         recovery.batch(self.config,self.database,directory)
         result=recovery.finalize(self.database,directory)

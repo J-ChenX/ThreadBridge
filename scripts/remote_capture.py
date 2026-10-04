@@ -35,7 +35,7 @@ def atomic_json(path, value):
 
 def initialize(database):
     database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with sqlite3.connect(database, timeout=3) as c:
+    with closing(sqlite3.connect(database, timeout=3)) as c, c:
         c.execute('PRAGMA journal_mode=WAL')
         c.execute('PRAGMA synchronous=FULL')
         c.execute('PRAGMA max_page_count=8192')
@@ -92,7 +92,7 @@ def poll(config, database):
     cache = json.loads(cache_path.read_text(encoding='utf-8')) if cache_path.exists() else {}
     from capture_health import read_health
     quarantined={v['thread_id'] for v in read_health(database)['failures'].values() if v.get('turn_id')=='recovery'}
-    with sqlite3.connect(index.as_uri() + '?mode=ro', uri=True, timeout=3) as c:
+    with closing(sqlite3.connect(index.as_uri() + '?mode=ro', uri=True, timeout=3)) as c, c:
         rows = c.execute('SELECT id,rollout_path,title FROM threads ORDER BY updated_at DESC LIMIT 200').fetchall()
     total = 0
     for native, raw_path, title in rows:
@@ -112,7 +112,7 @@ def poll(config, database):
             events, scanned = completed_events(path, native, home); total += scanned
             confirmed = old.get('turn_id')
             if old.get('completed_at') and not confirmed:
-                with sqlite3.connect(database) as c:
+                with closing(sqlite3.connect(database)) as c, c:
                     row=c.execute('SELECT turn_id FROM captured_turn_order WHERE thread_id=? AND completed_at=?',
                                   (native,old['completed_at'])).fetchone()
                     confirmed=row[0] if row else None
@@ -134,7 +134,7 @@ def poll(config, database):
                 result = capture_catalog(json.dumps(event), None, str(database), None, True,
                                          DB_BYTES, 64 * 1024 * 1024, str(index))
                 if result not in ('captured', 'duplicate'): raise ValueError('capture_unconfirmed')
-                with sqlite3.connect(database, timeout=3) as c:
+                with closing(sqlite3.connect(database, timeout=3)) as c, c:
                     display = title.strip()[:150] if isinstance(title,str) and title.strip() else '会话 · '+native[:8]
                     c.execute('UPDATE captured_replies SET title=? WHERE thread_id=? AND turn_id=?',
                               (display,native,event['turn-id']))
@@ -185,7 +185,7 @@ def snapshot(config, request):
         for native in excluded:uuid.UUID(native)
         purge(database,excluded)
     initialize(database); poll(config, database)
-    with sqlite3.connect(database, timeout=3) as c:
+    with closing(sqlite3.connect(database, timeout=3)) as c, c:
         identity = [c.execute('SELECT count(*),coalesce(max(rowid),0) FROM ' + table).fetchone()
                     for table in ('captured_replies', 'captured_user_messages', 'captured_turn_order')]
     health = Path(str(database) + '.health').read_bytes()
@@ -223,7 +223,7 @@ def dispatch(config, request):
     health=read_health(database)
     if health.get('overflow') or any(v.get('thread_id')==native for v in health['failures'].values()):
         raise ValueError('target_capture_unconfirmed')
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as c:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as c, c:
         if not c.execute('SELECT 1 FROM captured_replies WHERE thread_id=? LIMIT 1', (native,)).fetchone():
             raise ValueError('queue_target_not_captured')
     output=codex_output(config,['queue','--thread',native,'--message='+text],10,4096)

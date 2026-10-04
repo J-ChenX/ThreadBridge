@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Isolated loopback Hub/phone API verification; synthetic identities, no Codex calls."""
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -19,11 +20,11 @@ def main():
         root = Path(tmp)
         capture = root/'capture.sqlite'
         hubdb = root/'hub.sqlite'
-        with sqlite3.connect(capture) as db:
+        with closing(sqlite3.connect(capture)) as db, db:
             db.execute('CREATE TABLE captured_replies(thread_id TEXT,turn_id TEXT,reply TEXT,utf8_bytes INTEGER,captured_at INTEGER)')
             db.execute('INSERT INTO captured_replies VALUES (?,?,?,?,?)', (thread,turn,'TB-NOTIFY-OK',12,1))
         # Fixed synthetic test identities, no new real credentials.
-        with sqlite3.connect(hubdb) as db:
+        with closing(sqlite3.connect(hubdb)) as db, db:
             db.execute('CREATE TABLE devices(id TEXT PRIMARY KEY,token TEXT UNIQUE,role TEXT NOT NULL,name TEXT NOT NULL,expires INTEGER NOT NULL,revoked INTEGER NOT NULL DEFAULT 0,last_seen INTEGER NOT NULL DEFAULT 0)')
             db.execute("INSERT INTO devices(id,role,name,expires) VALUES ('fixture-host','agent','fixture',?)", (int(time.time())+60,))
             db.execute("INSERT INTO devices(id,token,role,name,expires) VALUES ('fixture-phone',?,'phone','fixture',?)", (hashlib.sha256(b'fixture-phone').hexdigest(),int(time.time())+60))
@@ -55,7 +56,7 @@ def main():
             subprocess.run(argv,env=env,check=True,stdout=subprocess.DEVNULL)
             assert get('/v1/events?after=0')['cursor']==events
             assert get(f'/v1/threads/{tid}/messages')['messages']==messages
-            with sqlite3.connect(hubdb) as db:assert db.execute('SELECT count(*) FROM outbox').fetchone()[0]==0
+            with closing(sqlite3.connect(hubdb)) as db, db:assert db.execute('SELECT count(*) FROM outbox').fetchone()[0]==0
             print(json.dumps({'result':'pass','scope':'isolated loopback Hub and phone HTTP API','checks':['captured turn/text exact','read-only target','event sync','Hub restart persistence','replay idempotency','no extra notifications'],'real_phone':False,'real_codex_send':False}))
         finally:
             process.terminate();process.wait(timeout=3)

@@ -3,6 +3,7 @@
 Run without --apply to inspect. --apply implements the user-approved data scope.
 A partial failure leaves the target stopped; never restarts an unfiltered source.
 """
+from contextlib import closing
 import argparse
 import hashlib
 import json
@@ -40,7 +41,7 @@ def invoke(host, operation, generation):
 
 
 def identity(path):
-    with sqlite3.connect(path) as c:
+    with closing(sqlite3.connect(path)) as c, c:
         return hashlib.sha256(json.dumps(c.execute('SELECT id,token,role,name,expires,revoked FROM devices ORDER BY id').fetchall()).encode()).hexdigest()
 
 
@@ -92,7 +93,7 @@ def main():
             policy=baseline(Path.home()/'.codex/state_5.sqlite',generation);policy['enabled']=True;write_policy(SOURCE,policy)
         else:assert invoke(host,'finalize',generation)['generation']==generation
     report={'generation':generation,'completed_at':int(time.time()),'scope':'ThreadBridge replicas only; original Codex data and device credentials unchanged','hosts':{n:{'existing_ids':len(plans[n]['excluded'])} for n in plans},'pairing_identity_unchanged':True,'threads':0,'messages':0,'deduplication_preserved':True,'physical_phone_cache':'cleared by 0.1.8 on next successful sync'}
-    with sqlite3.connect(c['hub_db']) as db:
+    with closing(sqlite3.connect(c['hub_db'])) as db, db:
         assert db.execute('SELECT count(*) FROM threads').fetchone()[0]==0
         assert db.execute('SELECT count(*) FROM messages').fetchone()[0]==0
     fleet.atomic(fleet.ROOT/'artifacts/collection-reset-verification.json',(json.dumps(report,ensure_ascii=False,indent=2)+'\n').encode())

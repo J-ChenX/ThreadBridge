@@ -4,6 +4,7 @@
 A runtime owner grant must be provisioned separately after stopping competing
 workers. No granting, discovery, fork, historical body reads or auto-retry here.
 """
+from contextlib import closing
 import argparse,fcntl,hashlib,json,os,selectors,sqlite3,subprocess,time,uuid
 from pathlib import Path
 FRAME=1024*1024
@@ -164,7 +165,7 @@ def dispatch(database,capture_db,codex,grant,command_id,execute=False,turn_timeo
         deadline=time.monotonic()+capture_timeout
         while True:
             try:
-                with sqlite3.connect('file:'+str(Path(capture_db).resolve())+'?mode=ro',uri=True) as source:
+                with closing(sqlite3.connect('file:'+str(Path(capture_db).resolve())+'?mode=ro',uri=True)) as source, source:
                     captured=source.execute('SELECT reply FROM captured_replies WHERE thread_id=? AND turn_id=?',(native,authoritative_turn)).fetchone()
                     marker=source.execute('SELECT request_id FROM captured_request_ids WHERE thread_id=? AND turn_id=?',(native,authoritative_turn)).fetchone()
                 if captured and marker in (None,(command_id,)):break
@@ -188,14 +189,14 @@ def dispatch(database,capture_db,codex,grant,command_id,execute=False,turn_timeo
             if child.stdin:child.stdin.close()
             if child.stdout:child.stdout.close()
         c.close()
-    with sqlite3.connect(database) as c:return c.execute('SELECT status,error,native_turn FROM commands WHERE id=?',(command_id,)).fetchone()
+    with closing(sqlite3.connect(database)) as c, c:return c.execute('SELECT status,error,native_turn FROM commands WHERE id=?',(command_id,)).fetchone()
 
 def preflight(database,codex,grant,execute=False):
     """Explicitly approved original-ID compatibility check; never starts a turn."""
     validate_grant(grant)
     if not execute:raise Stop('execution_not_enabled')
     native=grant['native_id'];host=grant['host_id'];thread=key(host,native)
-    with sqlite3.connect('file:'+str(Path(database).resolve())+'?mode=ro',uri=True) as c:
+    with closing(sqlite3.connect('file:'+str(Path(database).resolve())+'?mode=ro',uri=True)) as c, c:
         if c.execute("SELECT count(*) FROM commands WHERE thread=? AND status IN ('accepted','dispatching','upstream_queued','unknown')",(thread,)).fetchone()[0]:raise Stop('unresolved_request_before_handoff')
         saved=c.execute('SELECT revision FROM threads WHERE id=?',(thread,)).fetchone()
         if not saved:raise Stop('existing_captured_target_required')
@@ -228,7 +229,7 @@ def reconcile_completed(database,capture_db,grant):
     try:
         rows=c.execute("SELECT l.id,l.turn,x.created FROM resume_dispatch_ledger l JOIN commands x ON x.id=l.id WHERE l.host=? AND l.native=? AND l.turn IS NOT NULL AND x.status IN ('dispatching','unknown')",(host,native)).fetchall()
         try:
-            with sqlite3.connect('file:'+str(Path(capture_db).resolve())+'?mode=ro',uri=True) as source:
+            with closing(sqlite3.connect('file:'+str(Path(capture_db).resolve())+'?mode=ro',uri=True)) as source, source:
                 for command,turn,created in rows:
                     final=source.execute('SELECT captured_at FROM captured_replies WHERE thread_id=? AND turn_id=?',(native,turn)).fetchone()
                     marker=source.execute('SELECT request_id FROM captured_request_ids WHERE thread_id=? AND turn_id=?',(native,turn)).fetchone()

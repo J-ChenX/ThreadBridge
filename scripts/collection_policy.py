@@ -1,4 +1,5 @@
 """Persistent, fail-closed collection boundary; never modifies Codex data."""
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -76,7 +77,7 @@ def read_policy(database):
 
 
 def baseline(index, generation):
-    with sqlite3.connect(Path(index).resolve().as_uri() + '?mode=ro', uri=True) as connection:
+    with closing(sqlite3.connect(Path(index).resolve().as_uri() + '?mode=ro', uri=True)) as connection, connection:
         # Consistent full index, including archived threads; no LIMIT or body reads.
         connection.execute('BEGIN')
         ids = [row[0] for row in connection.execute('SELECT id FROM threads')]
@@ -96,7 +97,7 @@ def allowed(database, index, native):
         return False
     if not index:
         raise ValueError('collection_index_required')
-    with sqlite3.connect(Path(index).resolve().as_uri() + '?mode=ro', uri=True, timeout=3) as connection:
+    with closing(sqlite3.connect(Path(index).resolve().as_uri() + '?mode=ro', uri=True, timeout=3)) as connection, connection:
         columns = {r[1] for r in connection.execute('PRAGMA table_info(threads)')}
         creation = 'COALESCE(created_at_ms,created_at*1000)' if 'created_at_ms' in columns else 'created_at*1000'
         row = connection.execute('SELECT ' + creation + ' FROM threads WHERE id=?', (native,)).fetchone()
@@ -120,7 +121,7 @@ def _purge(database, natives):
     if added:
         policy['excluded'] = sorted(set(policy['excluded']) | natives)
         _write_policy(database, policy)
-    with sqlite3.connect(database, timeout=3) as connection:
+    with closing(sqlite3.connect(database, timeout=3)) as connection, connection:
         tables = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for table in ('captured_replies', 'captured_user_messages', 'captured_turn_order', 'captured_request_ids'):
             if table in tables:
@@ -139,7 +140,7 @@ HUB_TABLES=('threads','messages','events','outbox','history_positions','completi
 def erase_replica(path,generation):
     path=Path(path)
     if path.is_symlink():raise ValueError('replica_symlink_refused')
-    with collection_lock(path),sqlite3.connect(path,timeout=5) as connection:
+    with collection_lock(path),closing(sqlite3.connect(path,timeout=5)) as connection, connection:
         connection.execute('PRAGMA secure_delete=ON')
         tables={r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not ('captured_replies' in tables or {'devices','commands','messages'}<=tables):

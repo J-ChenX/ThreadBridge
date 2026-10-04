@@ -11,15 +11,22 @@ jobs:
   rust-python:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.14']
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Load the pinned Rust toolchain
         run: rustup show
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --release --locked
-      - run: python3 tests/run.py
+      - run: python tests/run.py
 
   android:
     runs-on: ubuntu-24.04
@@ -30,8 +37,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Install the pinned Android SDK packages
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Set up Android command-line tools and SDK packages
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
       - name: JVM regression
         run: android/gradlew -p android :app:testDebugUnitTest --no-daemon --no-parallel --console=plain
       - name: Debug build and Lint

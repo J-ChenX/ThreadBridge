@@ -1,11 +1,12 @@
 """Seed future-looking synthetic dialogs in the dedicated loopback UI fixture only."""
+from contextlib import closing
 import hashlib,json,sqlite3,time,uuid
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2];DB=ROOT/'local/ui-test-018/hub.sqlite'
 def key(host,native):return hashlib.sha256((host+'\0default\0'+native).encode()).hexdigest()
 def seed():
  now=int(time.time());mapping={}
- with sqlite3.connect(DB) as db:
+ with closing(sqlite3.connect(DB)) as db, db:
   actual={r[0] for r in db.execute("SELECT id FROM devices WHERE role='agent'")}
   assert actual=={'ui-fixture-host','fixture-lerrem','fixture-nix','fixture-windows'}
   for name,host,title in [('conversation','ui-fixture-host','优化手机端显示'),('lerrem','fixture-lerrem','整理今天的想法'),('nix','fixture-nix','检查服务运行'),('windows','fixture-windows','继续我的项目')]:

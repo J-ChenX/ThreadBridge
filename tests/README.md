@@ -18,6 +18,8 @@ python3 tests/run.py --unit-only
 python3 tests/run.py --integration-only --binary target/release/threadbridge
 ```
 
+CI 在 Python 3.10 与 3.14 分别执行完整回归。捕获 CLI 和 mock 子进程使用当前解释器，而非固定 `/usr/bin/python3`；部署机的 Python 路径仍由其服务配置决定。
+
 installed proxy 的 Rust fixture 默认忽略，它依赖本机 Codex CLI；单独运行仍只操作隔离 socket。常规 CI 不依赖该 CLI。
 
 ## Android 像素预览

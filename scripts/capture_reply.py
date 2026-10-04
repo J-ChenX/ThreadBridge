@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Capture allowlisted Codex notify replies locally; no network or session reads."""
+from contextlib import closing
 import argparse
 import json
 import os
@@ -61,7 +62,7 @@ def capture(payload, allowed_thread, database, title=None, title_index=None):
     if path.is_symlink():
         raise ValueError('symlink_database')
     os.umask(0o077)
-    with sqlite3.connect(path, timeout=3) as db:
+    with closing(sqlite3.connect(path, timeout=3)) as db, db:
         db.execute('PRAGMA synchronous=FULL')
         db.execute('CREATE TABLE IF NOT EXISTS captured_replies (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, reply TEXT NOT NULL, utf8_bytes INTEGER NOT NULL, captured_at INTEGER NOT NULL DEFAULT (unixepoch()), PRIMARY KEY(thread_id,turn_id))')
         db.execute('CREATE TABLE IF NOT EXISTS captured_request_ids(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,request_id TEXT NOT NULL,PRIMARY KEY(thread_id,turn_id))')
