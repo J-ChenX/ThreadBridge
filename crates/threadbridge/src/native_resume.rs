@@ -538,6 +538,28 @@ fn captured(
     })()
     .unwrap_or(false)
 }
+fn require_capture_policy(capture_db: &Path, native: &str) -> Result<()> {
+    if let Some(policy) = crate::collection::read_policy(capture_db)? {
+        ensure!(policy["enabled"] != false, "collection_disabled");
+        ensure!(
+            !policy["excluded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == native),
+            "collection_target_excluded"
+        );
+    }
+    Ok(())
+}
+
+// The collection writer and final capture use the same lock. A turn already sent
+// can become unknown on exclusion, but its durable intent can never become retryable.
+fn check_capture_policy(capture_db: &Path, native: &str) -> Result<()> {
+    let _guard = crate::collection::lock(capture_db)?;
+    require_capture_policy(capture_db, native)
+}
+
 fn known_reason(error: &anyhow::Error) -> &str {
     let reason = error.to_string();
     const KNOWN: &[&str] = &[
@@ -565,6 +587,10 @@ fn known_reason(error: &anyhow::Error) -> &str {
         "completion_turn_mismatch",
         "turn_not_completed",
         "final_capture_not_confirmed",
+        "collection_disabled",
+        "collection_target_excluded",
+        "collection_policy_missing",
+        "collection_policy_invalid",
     ];
     KNOWN
         .iter()
@@ -594,6 +620,7 @@ pub async fn dispatch(
     let mut turn = None;
     let mut protocol = None;
     let outcome=async {
+        check_capture_policy(capture_db,&grant.native_id)?;
         version(codex,grant).await?;protocol=Some(Protocol::spawn(codex,&grant.native_id).await?);let p=protocol.as_mut().unwrap();
         restore(p,grant,command["expected_revision"].as_str().unwrap_or(""),false).await?;
         validate_grant(grant)?;ensure!(command["expires_at"].as_i64().unwrap_or(0)>now(),"command_expired");
@@ -606,6 +633,8 @@ pub async fn dispatch(
         p.turn=Some(native_turn.clone());p.wait_completed(turn_timeout).await?;
         let finals=p.finals.iter().filter(|(t,_)|t.as_deref()==Some(&native_turn)).map(|(_,s)|s).collect::<Vec<_>>();
         if finals.len()==1 {
+            let _capture_guard=crate::collection::lock(capture_db)?;
+            require_capture_policy(capture_db,&grant.native_id)?;
             let has_title=c.prepare("PRAGMA table_info(threads)")?.query_map([],|r|r.get::<_,String>(1))?.any(|r|r.as_deref()==Ok("title"));
             let title:Option<String>=if has_title{c.query_row("SELECT title FROM threads WHERE id=?",[key(&grant.host_id,&grant.native_id)],|r|r.get(0)).optional()?}else{None};
             crate::native_capture::capture_completion(&json!({"type":"agent-turn-complete","thread-id":grant.native_id,"turn-id":native_turn,"last-assistant-message":finals[0],"input-messages":[]}).to_string(),&grant.native_id,capture_db,title.as_deref(),None,None,64*1024*1024,true)?;
@@ -730,6 +759,7 @@ async fn worker_inner(
 ) -> Result<()> {
     validate_grant(grant)?;
     ensure!(execute, "execution_not_enabled");
+    check_capture_policy(capture_db, &grant.native_id)?;
     ensure!(
         match competitor {
             Some(v) => v,
@@ -795,6 +825,7 @@ pub async fn run(args: ResumeArgs) -> Result<()> {
     ensure!(args.execute, "execution_not_enabled");
     let grant: Grant = serde_json::from_slice(&std::fs::read(&args.grant)?)?;
     if args.preflight {
+        check_capture_policy(&args.capture_db, &grant.native_id)?;
         println!("{}", preflight(&args.db, &args.codex, &grant, true).await?)
     } else if args.worker {
         worker(&args.db, &args.capture_db, &args.codex, &grant, true).await?
@@ -847,8 +878,12 @@ fn main(){
  if mode=="approval"||mode=="tool"{emit(json!({"id":"callback","method":if mode=="approval"{"item/commandExecution/requestApproval"}else{"item/tool/call"},"params":{"threadId":native}}));continue}
  emit(json!({"id":id,"result":{"turn":{"id":turn,"status":"inProgress"}}}));
  if mode=="hang"{std::thread::sleep(std::time::Duration::from_secs(30));continue}
- if mode=="client_final_only"||mode=="legacy_phase" {
- emit(json!({"method":"item/completed","params":{"threadId":native,"turnId":turn,"item":{"type":"agentMessage","phase":if mode=="client_final_only"{json!("final_answer")}else{Value::Null},"text":"synthetic final"}}}));
+ if mode=="wait_before_final" {
+ fs::write(root.join("started"),b"yes").unwrap();
+ while !root.join("continue").exists(){std::thread::sleep(std::time::Duration::from_millis(5));}
+ }
+ if mode=="client_final_only"||mode=="legacy_phase"||mode=="wait_before_final" {
+ emit(json!({"method":"item/completed","params":{"threadId":native,"turnId":turn,"item":{"type":"agentMessage","phase":if mode!="legacy_phase"{json!("final_answer")}else{Value::Null},"text":"synthetic final"}}}));
  }else{
  let c=rusqlite::Connection::open(root.join("capture.sqlite")).unwrap();
  c.execute_batch("CREATE TABLE captured_replies(thread_id TEXT,turn_id TEXT,reply TEXT,utf8_bytes INTEGER,captured_at INTEGER DEFAULT (unixepoch()));CREATE TABLE captured_request_ids(thread_id TEXT,turn_id TEXT,request_id TEXT);").unwrap();
@@ -1359,6 +1394,120 @@ fn main(){
             )
         }
     }
+    async fn late_policy_change(disable: bool) {
+        let f = Fixture::new();
+        f.mode("wait_before_final");
+        let initial = json!({"schema":1,"generation":uuid::Uuid::new_v4().to_string(),"cutoff_ms":1,"excluded":[]});
+        crate::collection::write_policy(&f.capture, &initial).unwrap();
+        let operation = dispatch(
+            &f.db,
+            &f.capture,
+            &f.binary,
+            &f.grant,
+            &f.command,
+            true,
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+        );
+        let change = async {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !f.root.path().join("started").exists() {
+                assert!(Instant::now() < deadline, "mock did not start turn");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Change the actual collection boundary after the authoritative turn acknowledgement.
+            if disable {
+                let mut policy = initial;
+                policy["enabled"] = json!(false);
+                crate::collection::write_policy(&f.capture, &policy).unwrap();
+            } else {
+                crate::collection::purge(&f.capture, &[NATIVE.into()]).unwrap();
+            }
+            fs::write(f.root.path().join("continue"), b"yes").unwrap();
+        };
+        let (result, _) = tokio::join!(operation, change);
+        let value = result.unwrap();
+        assert_eq!(value.2.as_deref(), Some(TURN));
+        state(
+            "unknown",
+            if disable {
+                "collection_disabled"
+            } else {
+                "collection_target_excluded"
+            },
+            value,
+        );
+        if f.capture.exists() {
+            let c = Connection::open(&f.capture).unwrap();
+            let tables: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='captured_replies'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if tables > 0 {
+                assert_eq!(
+                    c.query_row("SELECT count(*) FROM captured_replies", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                )
+            }
+        }
+        assert!(!crate::health::path(&f.capture).exists());
+        f.run().await.unwrap();
+        assert_eq!(f.starts(), 1);
+    }
+    #[tokio::test]
+    async fn deleted_target_final_never_recreates_capture_or_retries() {
+        late_policy_change(false).await
+    }
+    #[tokio::test]
+    async fn disabled_collection_final_never_saves_or_retries() {
+        late_policy_change(true).await
+    }
+    #[tokio::test]
+    async fn already_excluded_target_never_launches() {
+        let f = Fixture::new();
+        let policy = json!({"schema":1,"generation":uuid::Uuid::new_v4().to_string(),"cutoff_ms":1,"excluded":[NATIVE]});
+        crate::collection::write_policy(&f.capture, &policy).unwrap();
+        state(
+            "rejected",
+            "collection_target_excluded",
+            f.run().await.unwrap(),
+        );
+        assert!(f.rows().is_empty());
+        assert_eq!(
+            f.worker(true).await.unwrap_err().to_string(),
+            "collection_target_excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_preflight_refuses_excluded_handoff_before_launch() {
+        let f = Fixture::new();
+        let policy = json!({"schema":1,"generation":uuid::Uuid::new_v4().to_string(),"cutoff_ms":1,"excluded":[NATIVE]});
+        crate::collection::write_policy(&f.capture, &policy).unwrap();
+        let grant_path = f.root.path().join("grant.json");
+        fs::write(&grant_path, serde_json::to_vec(&f.grant).unwrap()).unwrap();
+        let args = ResumeArgs {
+            db: f.db.clone(),
+            capture_db: f.capture.clone(),
+            codex: f.binary.clone(),
+            grant: grant_path,
+            command: None,
+            worker: false,
+            preflight: true,
+            execute: true,
+        };
+        assert_eq!(
+            run(args).await.unwrap_err().to_string(),
+            "collection_target_excluded"
+        );
+        assert!(f.rows().is_empty());
+    }
+
     #[test]
     fn canonical_grant_hash_matches_existing_unicode_grants() {
         let f = Fixture::new();
