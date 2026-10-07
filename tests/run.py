@@ -42,9 +42,13 @@ def main():
             ('test_capture_correlation.py', []),
             ('test_subagent_cleanup.py', []),
             ('test_capture_health_scope.py', []),
+            ('test_capture_empty_reply.py', []),
             ('test_archived_cleanup.py', []),
             ('test_visible_history.py', []),
             ('test_android_migrations.py', []),
+            ('test_create_conversation.py', []),
+            ('test_project_alignment.py', []),
+            ('test_runtime_alignment.py', []),
         ]
         for name, extra in cases:
             print(f'Running {name} {" ".join(str(x) for x in extra if str(x).startswith("--"))}', flush=True)

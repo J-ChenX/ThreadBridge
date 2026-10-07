@@ -1,0 +1,11 @@
+# Reserve this subdomain in the cpolar account before starting the tunnel.
+# Keep the real account token in a private file with mode 0600, outside Git.
+authtoken: REPLACE_WITH_CPOLAR_ACCOUNT_TOKEN
+tunnels:
+  threadbridge-fixed:
+    proto: http
+    addr: 192.168.1.10:8787
+    subdomain: REPLACE_WITH_RESERVED_SUBDOMAIN
+    region: cn_vip
+    bind_tls: "true"
+    inspect: "false"

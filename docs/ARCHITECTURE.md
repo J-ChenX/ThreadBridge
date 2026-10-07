@@ -28,10 +28,12 @@ flowchart LR
 | M01 Android | `android/app/src/` | [Android 客户端](modules/Android客户端.md) |
 | M02 Hub | `crates/threadbridge/src/hub.rs`、`store.rs` | [通信与存储](modules/通信与存储.md) |
 | M03 Agent | `crates/threadbridge/src/agent.rs` | 持久发送意图，主动 WSS 或合并运行 |
-| M04 Adapter / Capture | `adapter.rs`、`probe.rs`、`capture.rs`、`queue.rs`、`native_capture.rs`、`native_input.rs`、`native_resume.rs` | [Codex 接入](modules/Codex接入.md) |
+| M04 Adapter / Capture | `new_threads.rs`、`adapter.rs`、`probe.rs`、`capture.rs`、`queue.rs`、`native_capture.rs`、`native_input.rs`、`native_resume.rs` | [Codex 接入](modules/Codex接入.md) |
 | M05 Protocol | `crates/threadbridge/src/model.rs` | 版本 1，身份和大小白名单 |
 | M06 Notification | `crates/threadbridge/src/notify.rs` | 持久 outbox、有效期和有界重试 |
 | M07 Operations | `main.rs`、`collection.rs`、`health.rs`、`native_fleet.rs`、`native_remote.rs`、`native_recovery.rs`、`collection_reset.rs`、`deploy/` | [运行与安装](运行与安装.md)、[多机接入](多机接入.md) |
+
+项目元数据来自原生已登记项目及根目录，按明确项目 ID 或 cwd 根目录匹配同步；已确认无项目归入“其他”，缺少元数据的旧副本显示“项目待同步”。手机保留空白对话，首次发送通过持久创建请求、对应设备的已验证 proxy 与原生 `thread/start` 创建，然后 queue 原始用户文字；结果映射到新原 ID。创建与续聊共用角色鉴权及不可重复发送账本，未知创建不重试。
 
 Hub 的命令账本、事件游标和通知 outbox 使用 SQLite WAL/FULL；Hub 的消息变化标记独立于完成轮次 ID，手机使用它与毫秒级活动时间判断未读和排序；手机 Room 为离线 UI 数据源；原 Codex 对话是原始正文和轮次的来源，ThreadBridge 只持有副本。原生身份结合 host/profile/thread 派生业务键，标题不参与路由。
 
@@ -60,3 +62,5 @@ observed：源码包含四机运维、完成回复独立落盘、用户消息同
 | G06 恢复 | WAL 一致性备份、只读恢复、撤销与重启测试 | 实际部署恢复、开机恢复及 24–72 小时运行 |
 
 构建和集成顺序为 Rust 单元/Clippy → release → Python 回环集成 → Android JVM/Lint/构建 → 原签名升级校验 → 经明确配置的实机验收。模块合同与 schema 变更须同步维护当前文档；共享协议、锁文件和数据库迁移统一集成。
+
+项目元数据由 project_metadata 模块读取原生项目/根目录及线程 cwd；只更新捕获库及 Hub 已有 ID 的归属，不导入被排除历史。项目名称作为可选字段兼容旧 API，Room6 保存名称及归属已知状态。消息呈现层按连续角色分组，native: 过程记录与 notify: 最终回复保留原稳定 ID，正文与原生账本不变。

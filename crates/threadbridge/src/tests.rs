@@ -16,6 +16,7 @@ fn setup() -> (tempfile::TempDir, Store, String, String, Snapshot) {
             updated_at: now(),
             can_send: true,
             history_cursor: None,
+            project: String::new(),
         },
         messages: vec![],
         initial: true,
@@ -24,6 +25,42 @@ fn setup() -> (tempfile::TempDir, Store, String, String, Snapshot) {
     db.snapshot(&host, &s).unwrap();
     (dir, db, host, phone, s)
 }
+#[test]
+fn snapshot_waits_for_another_process_writer_without_upgrade_failure() {
+    let (dir, db, host, _phone, mut snapshot) = setup();
+    snapshot.messages = vec![ChatMessage {
+        id: "concurrent-final".into(),
+        turn_id: "turn-1".into(),
+        role: "assistant".into(),
+        text: "durable reply".into(),
+        version: hash("durable reply"),
+        ordinal: now() * 1000,
+    }];
+    let writer = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+    writer
+        .execute_batch(
+            "BEGIN IMMEDIATE; UPDATE devices SET last_seen=last_seen+1 WHERE role='agent'",
+        )
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        writer.execute_batch("COMMIT").unwrap();
+    });
+    let result = db.capture_snapshot(&host, &snapshot, "test");
+    release.join().unwrap();
+    result.unwrap();
+    let saved: String =
+        db.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT body FROM messages WHERE id='concurrent-final'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(saved, "durable reply");
+}
+
 fn submit(s: &Snapshot) -> Submit {
     Submit {
         request_id: uuid::Uuid::new_v4().to_string(),

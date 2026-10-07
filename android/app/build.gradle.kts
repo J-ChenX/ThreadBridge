@@ -1,12 +1,19 @@
+import java.util.Properties
+
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.android"); id("org.jetbrains.kotlin.plugin.compose"); id("com.google.devtools.ksp") }
+// Private deployment defaults survive local rebuilds; environment values take precedence.
+val releaseConnection = Properties().apply {
+ val config = rootProject.file("../local/release-connection.properties")
+ if (config.isFile) config.inputStream().use { load(it) }
+}
 android {
  namespace = "dev.threadbridge"
  compileSdk = 35
- defaultConfig { applicationId = "dev.threadbridge"; minSdk = 26; targetSdk = 35; versionCode = 15; versionName = "0.1.14-test" }
+ defaultConfig { applicationId = "dev.threadbridge"; minSdk = 26; targetSdk = 35; versionCode = 22; versionName = "0.1.21-test" }
  defaultConfig {
   for (field in listOf("PUBLIC_TEST_SERVER", "PUBLIC_TEST_PREVIOUS_SERVER", "PUBLIC_TEST_HOST")) {
-   val value = System.getenv("THREADBRIDGE_$field") ?: ""
-   require(value.matches(Regex("[a-zA-Z0-9:/._-]*"))) { "Invalid $field" }
+   val value = System.getenv("THREADBRIDGE_$field") ?: releaseConnection.getProperty(field, "")
+   require(value.matches(Regex(if (field == "PUBLIC_TEST_PREVIOUS_SERVER") "[a-zA-Z0-9:/._,-]*" else "[a-zA-Z0-9:/._-]*"))) { "Invalid $field" }
    buildConfigField("String", field, "\"$value\"")
   }
  }
@@ -23,7 +30,6 @@ dependencies {
  implementation("androidx.compose.ui:ui")
  implementation("androidx.compose.foundation:foundation")
  implementation("androidx.compose.material3:material3")
- implementation("androidx.compose.material:material-icons-extended")
  implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
  implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
  implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")

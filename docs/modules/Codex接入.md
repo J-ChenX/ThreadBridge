@@ -29,6 +29,8 @@ M04 将已完成轮次、用户输入与发送回执转换为 ThreadBridge 投�
 
 单条 UTF-8 正文最多 256 KiB。保存预算、剩余磁盘和健康状态受限；错误明确报告，不以截断正文冒充成功。`.health` 双槽状态保留捕获意图和成功/失败，初始意图不可写时不能声称记录可靠。标题索引只读元数据，不能代替身份核验。
 
+身份有效且完成通知明确携带 null 或空字符串最终回复时，没有正文需要保存，返回 `ignored_empty_reply`，不创建正文或缺失用户输入告警；缺失字段、非法身份仍报告错误。历史回填仅在同一轮次同时具有空的 `final_answer`、无错误且明确为空的 `task_complete.last_agent_message`，并且没有已保存正文时，清除旧的 `missing_reply_identity` 误报。其他失败保留，手机刷新只能重新读取电脑状态，无法自行修复采集错误。
+
 通知入口和远端读取均受 `collection.rs` 的 cutoff、排除 ID、删除 ID 和 generation 约束。跨进程锁串行保护策略变更与捕获；策略无法核对时停止。可见历史回填只将源记录中明确 `final_answer` 且匹配 `task_complete.last_agent_message` 的成功轮次补入最终回复，不推测未完成结果。
 
 通知路径通过 `native_input.rs` 读取明确完成的当前轮次人类输入。图片消息要求所有内容项均带有人类元数据，支持重复文字项，剔除界面的附件包装文字；系统附加内容与工具结果不作为人类输入。读取失败时助手正文仍保存，健康状态说明用户消息缺失。`captured_user_messages` 与 `captured_turn_order` 支持准确顺序；Hub 在用户输入晚于回复到达时重新关联。
@@ -54,3 +56,7 @@ grant 必须显式绑定原 thread/host/cwd、CLI 版本、权限、工具兼容
 `cargo test --workspace --locked` 检查协议、目标核验和回执。`python3 tests/run.py --integration-only` 检查真实 Rust CLI、mock queue/resume、回环 HTTP、独立保存、重启、关联歧义和不重复发送。隔离 fixture 不调用真实 Codex。
 
 任何新 Codex 版本、执行路线或主机必须分别验证原 ID、上下文、工具、审批、并发和重启恢复。安装版持久记录兼容性、桌面 queue 调度、公网及真机表现属于当前限制；指定对话曾续聊成功不能取消这些验证要求。
+
+## 项目与手机新建
+
+项目归属由原生已登记项目及根目录匹配线程 cwd，兼容 worktree；项目 ID、名称、根目录进入独立 `captured_projects`、`captured_project_names` 及 `captured_project_catalog` 副本表，不导入旧对话正文。无元数据的旧来源显示“项目待同步”。`new_threads.rs` 在已验证启用 queue 的设备侧执行 `thread/start`，继承桌面既有权限并以真实原 ID queue 第一条人类文字；持久意图先于创建，原 ID 落库先于 queue，创建/queue 未知时不重试。原始 Codex 记录不因手机缓存清理而修改。手机接口与查询合同见 [通信与存储](通信与存储.md#项目与手机新建)。新建需要匹配版本的 Hub、bridge 和远端 helper，APK 安装不会升级电脑服务。

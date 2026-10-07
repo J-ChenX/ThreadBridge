@@ -18,6 +18,11 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         [native],
         |r| r.get(0),
     )?;
+    let registered: bool = source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE name='projects'",
+        [],
+        |r| r.get(0),
+    )?;
     let mut stream = BufReader::new(File::open(path)?);
     let mut identity = false;
     let mut used = 0;
@@ -26,6 +31,8 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
     let mut finals = BTreeMap::<String, String>::new();
     let mut completed = BTreeMap::<String, i64>::new();
     let mut confirmed = BTreeMap::<String, (String, i64)>::new();
+    let mut empty_finals = BTreeMap::<String, bool>::new();
+    let mut empty_completions = BTreeMap::<String, bool>::new();
     loop {
         let line = native_capture::read_bounded_line(&mut stream, native_input::MAX_LINE)?;
         if line.is_empty() {
@@ -45,6 +52,20 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         if record["type"] == "session_meta" {
             ensure!(p["id"] == native, "visible_history_identity_mismatch");
             identity = true;
+            if !registered {
+                if let Some(project) = p["cwd"].as_str().filter(|p| {
+                    (p.starts_with('/')
+                        || (p.len() > 2
+                            && p.as_bytes()[1] == b':'
+                            && matches!(p.as_bytes()[2], b'\\' | b'/')))
+                        && p.len() <= 2048
+                        && !p.contains(['\0', '\n', '\r'])
+                }) {
+                    let db = native_capture::open_database(database)?;
+                    db.execute_batch("CREATE TABLE IF NOT EXISTS captured_project_catalog(project_path TEXT PRIMARY KEY);CREATE TABLE IF NOT EXISTS captured_projects(thread_id TEXT PRIMARY KEY,project_path TEXT NOT NULL)")?;
+                    db.execute("INSERT INTO captured_projects VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET project_path=excluded.project_path",params![native,project])?;
+                }
+            }
         }
         if !identity {
             continue;
@@ -63,6 +84,17 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
                 let content = p["content"]
                     .as_array()
                     .context("visible_history_content_missing")?;
+                if p["phase"] == "final_answer" {
+                    let empty = !content.is_empty()
+                        && content.iter().all(|item| {
+                            item["type"] == "output_text"
+                                && item["text"].as_str().is_some_and(str::is_empty)
+                        });
+                    empty_finals
+                        .entry(turn.into())
+                        .and_modify(|previous| *previous &= empty)
+                        .or_insert(empty);
+                }
                 if content.iter().any(|item| item["type"] != "output_text") {
                     continue;
                 }
@@ -114,6 +146,14 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
             )?
             .timestamp_millis();
             completed.insert(turn.into(), stamp);
+            let empty = p["error"].is_null()
+                && p.get("last_agent_message").is_some_and(|reply| {
+                    reply.is_null() || reply.as_str().is_some_and(str::is_empty)
+                });
+            empty_completions
+                .entry(turn.into())
+                .and_modify(|previous| *previous &= empty)
+                .or_insert(empty);
             if p["error"].is_null() {
                 if let Some(text) = p["last_agent_message"].as_str() {
                     if finals
@@ -197,6 +237,28 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
                 "UPDATE captured_replies SET captured_at=?3 WHERE thread_id=?1 AND turn_id=?2",
                 params![native, turn, stamp / 1000],
             )?;
+        }
+    }
+    // Reconcile only old empty-reply misclassifications proven by both native
+    // records. Never clear a real save failure or infer success from absence.
+    if health::path(database).exists() {
+        let state = health::read(database)?;
+        for (turn, empty) in empty_finals {
+            if !empty || empty_completions.get(&turn) != Some(&true) {
+                continue;
+            }
+            let failure = &state["failures"][format!("{native}:{turn}")];
+            if failure["reason"] != "missing_reply_identity" {
+                continue;
+            }
+            let saved: bool = db.query_row(
+                "SELECT count(*)>0 FROM captured_replies WHERE thread_id=?1 AND turn_id=?2",
+                params![native, turn],
+                |r| r.get(0),
+            )?;
+            if !saved {
+                health::update(database, native, &turn, None, failure["attempt"].as_str())?;
+            }
         }
     }
     Ok(count)

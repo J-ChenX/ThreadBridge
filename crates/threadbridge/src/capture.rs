@@ -102,6 +102,23 @@ fn import_title(
         fallback.clone()
     };
     anyhow::ensure!(title.len() <= 512, "invalid_capture_title");
+    let project = if source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_projects'",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        use rusqlite::OptionalExtension;
+        source
+            .query_row(
+                "SELECT project_path FROM captured_projects WHERE thread_id=?1",
+                [native],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let projection = Thread {
         id: key(host, native),
         native_id: native.into(),
@@ -117,6 +134,7 @@ fn import_title(
         updated_at: updated,
         can_send: enabled,
         history_cursor: None,
+        project,
     };
     let has_users: bool = source.query_row(
         "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_user_messages'",
@@ -241,7 +259,7 @@ fn import_title(
             // Require one active command, the preceding revision, exact input
             // digest and a source input time after the durable send intent.
             let c = db.0.lock().unwrap();
-            let mut q = c.prepare("SELECT x.id,json_extract(x.payload,'$.expected_revision'),json_extract(x.payload,'$.text'),s.started_at FROM commands x JOIN capture_queue_ledger q ON q.id=x.id LEFT JOIN capture_queue_send_times s ON s.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued')")?;
+            let mut q = c.prepare("SELECT x.id,json_extract(x.payload,'$.expected_revision'),json_extract(x.payload,'$.text'),s.started_at,coalesce((SELECT cr.thread=x.thread FROM creation_results cr WHERE cr.command=x.id),0) AND json_extract(x.payload,'$.kind')='create' FROM commands x JOIN capture_queue_ledger q ON q.id=x.id LEFT JOIN capture_queue_send_times s ON s.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued')")?;
             let active = q
                 .query_map(rusqlite::params![host, key(host, native)], |r| {
                     Ok((
@@ -249,12 +267,18 @@ fn import_title(
                         r.get::<_, Option<String>>(1)?,
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, bool>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if let [(request, Some(expected), Some(input), Some(created))] = active.as_slice() {
+            if let [(request, Some(expected), Some(input), Some(created), created_native)] =
+                active.as_slice()
+            {
                 let matches: bool = source.query_row("SELECT count(*)=1 FROM captured_user_messages WHERE thread_id=?1 AND turn_id=?2 AND input_digest=?3 AND created_at>=?4 AND created_at<=?5",rusqlite::params![native,turn,hash(input),created,captured.saturating_mul(1000).saturating_add(999)],|r|r.get(0))?;
-                if prior.as_deref() == Some(expected) && matches {
+                if (prior.as_deref() == Some(expected)
+                    || (*created_native && expected.is_empty() && prior.is_none()))
+                    && matches
+                {
                     eligible.push(request.clone());
                 }
             }
@@ -400,6 +424,80 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 /// Independent read projection: no Codex process, CLI, model, or send permission.
+pub fn import_projects(db: &Store, source: &Path, host: &str) -> Result<()> {
+    let c = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for table in ["captured_project_catalog"] {
+        if !c.query_row(
+            "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get::<_, bool>(0),
+        )? {
+            continue;
+        }
+        for path in c
+            .prepare(&format!(
+                "SELECT DISTINCT project_path FROM {table} LIMIT 1000"
+            ))?
+            .query_map([], |r| r.get::<_, String>(0))?
+        {
+            let path = path?;
+            if !path.is_empty() && path.len() <= 2048 && !path.contains(['\0', '\r', '\n']) {
+                paths.insert(path);
+            }
+        }
+    }
+    let mut hub = db.0.lock().unwrap();
+    let tx = hub.transaction()?;
+    tx.execute("DELETE FROM host_projects WHERE host=?1", [host])?;
+    for path in paths.into_iter().take(1000) {
+        tx.execute(
+            "INSERT INTO host_projects VALUES(?1,?2)",
+            rusqlite::params![host, path],
+        )?;
+    }
+    let exists = |table: &str| -> Result<bool> {
+        Ok(c.query_row(
+            "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get(0),
+        )?)
+    };
+    if exists("captured_project_names")? {
+        tx.execute("DELETE FROM project_names WHERE host=?1", [host])?;
+        for row in c
+            .prepare("SELECT project_path,project_name FROM captured_project_names LIMIT 1000")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        {
+            let (path, name) = row?;
+            if path.len() <= 2048 && name.len() <= 512 {
+                tx.execute(
+                    "INSERT INTO project_names VALUES(?1,?2,?3)",
+                    rusqlite::params![host, path, name],
+                )?;
+            }
+        }
+    }
+    if exists("captured_projects")? {
+        tx.execute(
+            "DELETE FROM thread_projects WHERE thread IN (SELECT id FROM threads WHERE host=?1)",
+            [host],
+        )?;
+        for row in c
+            .prepare("SELECT thread_id,project_path FROM captured_projects LIMIT 100000")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        {
+            let (native, path) = row?;
+            let id = key(host, &native);
+            if path.len() <= 2048 {
+                tx.execute("INSERT INTO thread_projects SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM threads WHERE id=?1 AND host=?3) ON CONFLICT(thread) DO UPDATE SET project=excluded.project",rusqlite::params![id,path,host])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub async fn sync_catalog(
     db: Store,
     source: std::path::PathBuf,
@@ -438,6 +536,10 @@ pub async fn sync_catalog(
     anyhow::ensure!(valid, "capture_requires_existing_authorized_host");
     let mut fingerprints = std::collections::BTreeMap::new();
     loop {
+        if let Some(index) = &native_index {
+            let _ = crate::native_remote::refresh_projects(&source, index);
+        }
+        let _ = import_projects(&db, &source, &host);
         let selected = if all_captured {
             let read = || -> Result<std::collections::BTreeMap<String, String>> {
                 let c = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -506,9 +608,12 @@ pub async fn sync_catalog(
             } else {
                 Some(title.as_str())
             };
-            if import_title(&db, &source, &host, native, hint).is_err() {
+            if let Err(error) = import_title(&db, &source, &host, native, hint) {
                 health["projection_error"] = serde_json::json!("completion_projection_failed");
-                eprintln!("Completion projection unavailable; retrying without sending");
+                eprintln!(
+                    "Completion projection unavailable for {}: {error}; retrying without sending",
+                    &native[..8]
+                );
             }
         }
         save_health(&db, &host, health)?;
@@ -628,6 +733,35 @@ pub async fn run(
     }
     loop {
         db.heartbeat(&host)?;
+        if enabled && native.is_none() {
+            db.0.lock().unwrap().execute("INSERT INTO creation_hosts VALUES(?1,?2) ON CONFLICT(host) DO UPDATE SET last_seen=excluded.last_seen",rusqlite::params![host,now()])?;
+            if let Some(cmd) = db.claim_creation(&host)? {
+                if crate::new_threads::dispatch(
+                    &db,
+                    &source,
+                    &codex,
+                    &host,
+                    verified.as_deref().unwrap_or(""),
+                    &cmd,
+                )
+                .await
+                .is_err()
+                {
+                    db.0.lock().unwrap().execute(
+                        "UPDATE capture_queue_ledger SET status='unknown' WHERE id=?1",
+                        [&cmd.id],
+                    )?;
+                    db.receipt(
+                        &host,
+                        &cmd.id,
+                        "unknown",
+                        None,
+                        Some("creation_unconfirmed_no_retry"),
+                    )?;
+                }
+            }
+        }
+        let _ = import_projects(&db, &source, &host);
         match bridge_threads(&source, native.as_deref()) {
             Err(_) => eprintln!("Capture discovery unavailable; retrying without sending"),
             Ok(threads) => {
@@ -718,6 +852,7 @@ mod tests {
                 updated_at: now(),
                 can_send: true,
                 history_cursor: None,
+                project: String::new(),
             },
             messages: vec![],
             initial: false,

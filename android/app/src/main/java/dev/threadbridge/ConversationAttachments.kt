@@ -2,16 +2,15 @@ package dev.threadbridge
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.CancellationException
 
 object ConversationAttachments {
@@ -39,20 +38,18 @@ object ConversationAttachments {
   try {bitmap=repo.userImage(message,id)}catch(e:CancellationException){throw e}catch(_:Exception){failed=true}
  }
  val loaded=bitmap
- if(loaded==null)Surface(modifier=Modifier.width(156.dp).height(100.dp),shape=MaterialTheme.shapes.medium) {
+ if(loaded==null)Surface(modifier=Modifier.width(220.dp).height(164.dp),shape=BridgeShapes.Row) {
   Box(contentAlignment=Alignment.Center) {
    if(failed)TextButton(onClick={attempt++}){Text("重试加载图片")}
    else CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp)
   }
  }else {
-  Image(loaded.asImageBitmap(),"图片附件",modifier=Modifier.widthIn(max=220.dp).heightIn(max=180.dp).clickable{expanded=true},contentScale=ContentScale.Fit)
-  if(expanded)Dialog(onDismissRequest={expanded=false}) {
-   Surface(shape=MaterialTheme.shapes.medium) {
-    Column(horizontalAlignment=Alignment.CenterHorizontally) {
-     Image(loaded.asImageBitmap(),"图片预览",modifier=Modifier.fillMaxWidth().heightIn(max=600.dp),contentScale=ContentScale.Fit)
-     TextButton(onClick={expanded=false}){Text("关闭")}
-    }
+  Box(Modifier.width(220.dp).height(164.dp).clip(BridgeShapes.Row).softClickable{expanded=true}){
+   Image(loaded.asImageBitmap(),"查看图片附件",modifier=Modifier.fillMaxSize(),contentScale=ContentScale.Fit)
+   Surface(shape=androidx.compose.foundation.shape.CircleShape,color=MaterialTheme.colorScheme.surface.copy(alpha=0.92f),modifier=Modifier.align(Alignment.BottomEnd).padding(8.dp)){
+    Icon(BridgeIcons.Expand,null,Modifier.padding(7.dp).size(16.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
    }
   }
+  if(expanded)ConversationImageViewer(repo,message,id,loaded){expanded=false}
  }
 }

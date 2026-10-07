@@ -4,15 +4,20 @@ import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName="threads")
-data class ThreadRow(@PrimaryKey val id:String, val title:String, val hostId:String, val status:String, val revision:String, val updated:Long, val canSend:Boolean, val online:Boolean, val historyCursor:String?, @ColumnInfo(defaultValue="0") val messageRevision:Long=0, @ColumnInfo(defaultValue="0") val messageActivityAt:Long=0)
+data class ThreadRow(@PrimaryKey val id:String, val title:String, val hostId:String, val status:String, val revision:String, val updated:Long, val canSend:Boolean, val online:Boolean, val historyCursor:String?, @ColumnInfo(defaultValue="0") val messageRevision:Long=0, @ColumnInfo(defaultValue="0") val messageActivityAt:Long=0, @ColumnInfo(defaultValue="''") val project:String="", @ColumnInfo(defaultValue="0") val localOnly:Boolean=false, @ColumnInfo(defaultValue="''") val projectName:String="", @ColumnInfo(defaultValue="0") val projectKnown:Boolean=false)
 @Entity(tableName="messages", primaryKeys=["threadId","id"], indices=[Index(value=["threadId","ordinal"])])
-data class MessageRow(val threadId:String,val id:String,val turnId:String,val role:String,val text:String,val version:String,val ordinal:Long,val characters:Int)
+data class MessageRow(val threadId:String,val id:String,val turnId:String,val role:String,val text:String,val version:String,val ordinal:Long,val characters:Int, @ColumnInfo(defaultValue="0") val timestamp:Long=0)
 @Entity(tableName="drafts") data class Draft(@PrimaryKey val threadId:String,val text:String)
 @Entity(tableName="pending") data class Pending(@PrimaryKey val requestId:String,val threadId:String,val payload:String,val status:String,val commandId:String?,val error:String?)
 @Entity(tableName="sync") data class SyncState(@PrimaryKey val id:Int=1,val cursor:Long,@ColumnInfo(defaultValue="''") val generation:String="")
 @Entity(tableName="hosts") data class HostRow(@PrimaryKey val id:String,val name:String,val online:Boolean)
+@Entity(tableName="projects",primaryKeys=["hostId","path"]) data class ProjectRow(val hostId:String,val path:String, @ColumnInfo(defaultValue="''") val name:String="")
 @Entity(tableName="chunks",primaryKeys=["threadId","messageId","version","offset"]) data class ChunkRow(val threadId:String,val messageId:String,val version:String,val offset:Int,val text:String)
 @androidx.room.Dao interface BridgeDao {
+ @Query("SELECT name FROM projects WHERE hostId=:host AND path=:path") suspend fun projectName(host:String,path:String):String?
+ @Query("SELECT * FROM projects ORDER BY hostId,path") fun projects():Flow<List<ProjectRow>>
+ @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putProjects(rows:List<ProjectRow>)
+ @Query("DELETE FROM projects") suspend fun clearProjects()
  @Query("SELECT * FROM hosts ORDER BY CASE lower(name) WHEN 'echova' THEN 0 WHEN 'lerrem' THEN 1 WHEN 'nix' THEN 2 ELSE 3 END,name") fun hosts():Flow<List<HostRow>>
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putHosts(rows:List<HostRow>)
  @Query("DELETE FROM hosts") suspend fun clearHosts()
@@ -21,6 +26,7 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Query("DELETE FROM pending") suspend fun clearPending()
  @Query("DELETE FROM drafts WHERE threadId=:id") suspend fun deleteDraft(id:String)
  @Query("DELETE FROM pending WHERE threadId=:id") suspend fun deletePending(id:String)
+ @Query("SELECT * FROM threads") suspend fun allThreads():List<ThreadRow>
  @Query("SELECT id FROM threads") suspend fun threadIds():List<String>
  @Query("DELETE FROM threads WHERE id=:id") suspend fun deleteThread(id:String)
  @Query("DELETE FROM messages WHERE threadId=:id") suspend fun deleteThreadMessages(id:String)
@@ -44,6 +50,7 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putPending(row:Pending)
  @Query("SELECT * FROM pending WHERE threadId=:id ORDER BY rowid DESC LIMIT 1") fun pending(id:String):Flow<Pending?>
  @Query("SELECT * FROM pending WHERE status IN ('submitting','accepted','dispatching','upstream_queued','unknown') LIMIT 128") suspend fun unresolved():List<Pending>
+ @Query("SELECT p.* FROM pending p JOIN threads t ON p.threadId=t.id WHERE t.localOnly=1 LIMIT 128") suspend fun localCreations():List<Pending>
  @Query("SELECT * FROM pending WHERE requestId=:id") suspend fun pendingById(id:String):Pending?
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putSync(row:SyncState)
  @Query("SELECT cursor FROM sync WHERE id=1") suspend fun cursor():Long?
@@ -52,5 +59,5 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Query("DELETE FROM messages WHERE rowid IN (SELECT rowid FROM messages ORDER BY rowid ASC LIMIT 100)") suspend fun evictMessages()
  @Query("DELETE FROM messages WHERE rowid IN (SELECT rowid FROM messages ORDER BY rowid ASC LIMIT MAX(0,(SELECT count(*) FROM messages)-5000))") suspend fun prune()
 }
-@Database(entities=[ThreadRow::class,MessageRow::class,Draft::class,Pending::class,SyncState::class,ChunkRow::class,HostRow::class],version=4,exportSchema=true)
+@Database(entities=[ThreadRow::class,MessageRow::class,Draft::class,Pending::class,SyncState::class,ChunkRow::class,HostRow::class,ProjectRow::class],version=6,exportSchema=true)
 abstract class BridgeDatabase:RoomDatabase(){abstract fun dao():BridgeDao}

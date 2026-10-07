@@ -1,0 +1,23 @@
+{
+  "java.jdt.ls.java.home": "/home/echova/.local/share/mise/installs/java/temurin-25.0.4+101.0.LTS",
+  "java.configuration.runtimes": [
+    {
+      "name": "JavaSE-17",
+      "path": "/home/echova/code/ThreadBridge/local/toolchains/jdk17",
+      "default": true
+    },
+    {
+      "name": "JavaSE-25",
+      "path": "/home/echova/.local/share/mise/installs/java/temurin-25.0.4+101.0.LTS"
+    }
+  ],
+  "java.import.gradle.java.home": "/home/echova/code/ThreadBridge/local/toolchains/jdk17",
+  "java.import.exclusions": [
+    "**/node_modules/**",
+    "**/.metadata/**",
+    "**/archetype-resources/**",
+    "**/META-INF/maven/**",
+    "**/local/**"
+  ],
+  "gradle.nestedProjects": ["android"]
+}

@@ -301,7 +301,10 @@ pub fn batch_limits(
                 "capture_watermark_mismatch"
             );
             let turns: BTreeSet<&str> = rows.iter().map(|(t, _)| t.as_str()).collect();
-            for table in &TABLES[1..] {
+            for table in TABLES[1..]
+                .iter()
+                .filter(|table| **table != "captured_projects")
+            {
                 let mut s = db.prepare(&format!(
                     "SELECT DISTINCT turn_id FROM {table} WHERE thread_id=?"
                 ))?;

@@ -1,0 +1,16 @@
+[Unit]
+Description=ThreadBridge fixed cpolar tunnel
+After=network-online.target threadbridge-phone-hub.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the private config path. Use a free loopback inspector port.
+# cpolar 3.3.12 rejects inspect-addr=false; a loopback port keeps it local.
+ExecStart=/usr/local/bin/cpolar start -config=/protected/path/cpolar.yml -daemon=off -processMode=single -dashboard=off -inspect-addr=127.0.0.1:4041 -log=none threadbridge-fixed
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

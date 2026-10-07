@@ -18,6 +18,7 @@ pub const CAPTURE_TABLES: &[&str] = &[
     "captured_turn_order",
     "captured_visible_messages",
     "captured_images",
+    "captured_projects",
 ];
 pub const HUB_TABLES: &[&str] = &[
     "threads",
@@ -34,6 +35,9 @@ pub const HUB_TABLES: &[&str] = &[
     "attachments",
     "thread_message_state",
     "resume_owners",
+    "thread_projects",
+    "creation_results",
+    "creation_hosts",
 ];
 pub fn suffix(path: &Path, extra: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();

@@ -41,6 +41,24 @@ python3 scripts/android_preview.py
 
 resume worker 集成在 mock 轮次进行中发送 SIGINT，确认最终捕获、回执和租约释放完成后退出。
 
-`test_visible_history.py` 验证图片人类消息、重复文字项、进行中过程说明、原始排序、最终回复去重、图片接口鉴权和副本清理；工具/推理不进入消息。`ConversationAttachmentsTest` 验证附件标记与正文分离。可见历史集成检查同一时间戳的新过程说明推进消息变化标记、完成轮次 ID 保持不变、重放不推进及清理状态；主页 JVM 检查进行中消息未读、毫秒级排序与旧已读格式兼容。清理集成覆盖缺失/损坏策略提前拒绝且不创建备份；Rust 恢复检查 18 MiB 图片摘要与图片改动后计划失效。`test_android_migrations.py` 用真实声明的迁移 SQL 验证 Room 1/2/3→4 与导出 schema 一致，并保留旧缓存和草稿；不替代真机升级验收。
+`test_visible_history.py` 验证图片人类消息、重复文字项、进行中过程说明、原始排序、最终回复去重、图片接口鉴权和副本清理；工具/推理不进入消息。`ConversationAttachmentsTest` 验证附件标记与正文分离。可见历史集成检查同一时间戳的新过程说明推进消息变化标记、完成轮次 ID 保持不变、重放不推进及清理状态；主页 JVM 检查进行中消息未读、毫秒级排序与旧已读格式兼容。清理集成覆盖缺失/损坏策略提前拒绝且不创建备份；Rust 恢复检查 18 MiB 图片摘要与图片改动后计划失效。`test_android_migrations.py` 用真实声明的迁移 SQL 验证 Room 1/2/3/4/5→6 与导出 schema 一致，并保留旧缓存和草稿；不替代真机升级验收。
 
 安装当前签名包后运行 `python3 tests/android/qa_visible_history.py`，在专用模拟器验证图片缩略图、用户正文、过程说明、最终回复、图片预览与重启缓存，不发送真实对话。
+
+0.1.15 签名包运行 `qa_android_ui015.py`：专用模拟器/合成 Hub 验证设备项目层级、最近 3 个与未读并集、项目折叠、标题搜索预览之外的结果、置顶收藏重启持久化、标准时间戳、主页唯一连接入口、空白首次发送及新原 ID 切换、深色/大字体截图；发送只进入合成 Hub 生成的回执，不调用真实 Codex。`test_create_conversation.py` 通过真实 loopback Hub/capture bridge 和固定 mock CLI 验证持久创建、首轮完成回执、原 ID 映射、项目、搜索和重启无重发。Room 迁移覆盖 1/2/3/4→5。
+
+0.1.16：qa_android_ui016.py 使用原签名升级Room6，验证设备/项目双层吸顶、注册项目名称、过程展开收起且最终回复保留、连续同角色时间段及同主题新建选择页（含深色、大字体），不提交命令。test_project_alignment.py 验证只读规划、只对齐既有ID、项目改名/删除、其他主机隔离与正文/配对/策略/请求不变。
+
+qa_android_ui016_boundaries.py 验证跨项目及跨设备时主页/侧边栏固定栏切换；test_runtime_alignment.py 以 fake systemctl 注入首个启动失败，验证全部原 active 服务恢复、配置回退、inactive peer 与 unknown 请求保留、活动发送阻止切换。
+
+0.1.17 的 qa_android_ui017.py 验证短过程、超过视口的长过程与历史轮次向下展开，过程栏位置保持、正文在其下方、收起恢复原位置，不提交任何命令。
+
+0.1.18：qa_android_polish018.py 使用 ffmpeg/ffprobe 对模拟器展开录屏采样，检查过程栏中间帧稳定、透明色插值发暗及胶囊范围；覆盖连续反向点击、系统动画关闭、375dp 小屏、2倍字体深色、横屏、平板横竖屏、键盘焦点、52dp/100dp 输入栏、48dp 发送触控区域、键盘收起/重启保留草稿及无命令提交，并复验图标菜单、置顶/收藏两态和搜索选中反馈（还原测试标记）。render_icon_audit.py 从 Kotlin 直接导出浅深色、14/18/20/24dp 的图标审查 SVG。qa_android_ui016_boundaries.py 同时检查项目固定栏不覆盖设备栏，可在2倍字体配置下复验。qa_android_ui016.py/017.py 可用 THREADBRIDGE_QA_VERSION 指定当前兼容版本重验。
+
+0.1.19：`qa_android_library019.py` 用专用模拟器验证每个项目最近 3 个与未读并集、展开全部/收起、两级折叠、侧边栏共享展开状态；特别构造十分钟前的旧未读对话，打开变为已读后检查 Room 对话仍存在并可展开访问。一周清理按原策略删除本机副本，同一修订不被同步回填，主动标题搜索可重新访问，合成 Hub 原数据和命令数不变。`qa_android_images019.py` 使用自绘 2400×1600 测试图，通过实际签名 APK 验证全屏、缩放控件、双击、真实双指缩放、平移、复位、5 倍边界、返回/重开、深色外观、375dp/两倍字体及横屏；ImageGestures.java 只在专用 API 35 模拟器的 shell 中注入手势，不进入 APK；Pillow 使用桌面内置 Python。`ImageViewerGeometryTest` 验证缩放焦点、适配留白/平移边界、采样及复位，`ConversationTimelineTest` 包含一万条同角色连续消息排序回归。
+
+0.1.20：`PublicTestConnectionTest` 检查已知旧入口精确匹配、目标 HTTPS、主机身份和其他配对隔离，`ConnectionDiagnosticsTest` 检查错误分类及响应/凭证文本不进入 UI。`qa_android_connection020.py` 在专用模拟器使用实际签名 APK 和隔离 HTTP 代理，拒绝 WebSocket 后验证仍显示已连接、无推送时新对话自动轮询到达；模拟 HTML 404、成功但无效的数据、401，检查具体诊断、自动恢复和缓存/草稿/加密凭证保留，合成 Hub 命令数不变。脚本只临时修改模拟器的合成服务器地址，结束后恢复，不接触生产凭证。生产入口只能以无凭证请求验证路由/TLS；真机的自动迁移结果仍需覆盖安装确认。
+
+0.1.21：`ConnectionConfigurationTest` 验证 HTTPS/私人 IP、嵌入凭证/查询参数/错误端口拒绝、空密钥沿用、请求头注入拒绝及不同 collection 隔离。`qa_android_settings021.py` 在实际签名 APK 和合成 Hub 上验证设置取消、空密钥切换地址、错误密钥和不同库拒绝、新密钥显示/隐藏和加密保存、同库缓存/草稿保留、重新配对确认，以及深色/375dp 两倍字体/横屏/关闭动画；不发送远端命令，生产凭证与生产库不参与测试。固定公网入口需独立核对保留记录、正常 DNS/TLS 无凭证鉴权响应、单服务重启后地址仍一致和原其他隧道继续运行。
+
+`qa_android_keyentry021.py` 另使用没有现存数据的独立 debug 包，验证首次地址/密钥连接直接进入主页且侧边栏关闭、未经过配对交换、重启后加密凭证可用以及命令数不变；结束删除该测试包及合成手机身份，实际签名 release 包的数据不受影响。

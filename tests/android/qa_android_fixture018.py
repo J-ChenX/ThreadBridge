@@ -39,9 +39,13 @@ try:
  print('synthetic UI fixture ready on loopback; pairing saved privately',flush=True)
  while True:
   with closing(sqlite3.connect(db,timeout=3)) as c, c:
-   now=int(time.time());c.execute("UPDATE devices SET last_seen=? WHERE role='agent'",(now,));[c.execute('INSERT OR REPLACE INTO capture_health VALUES(?,?,?)',(hid,json.dumps({'failures':{}}),now)) for hid,_ in hosts]
+   now=int(time.time());[c.execute("INSERT OR REPLACE INTO creation_hosts VALUES(?,?)",(hid,now)) for hid,_ in hosts];c.execute("UPDATE devices SET last_seen=?,expires=? WHERE role='agent'",(now,now+86400));[c.execute('INSERT OR REPLACE INTO capture_health VALUES(?,?,?)',(hid,json.dumps({'failures':{}}),now)) for hid,_ in hosts]
    for command,thread,payload in c.execute("SELECT id,thread,payload FROM commands WHERE status='accepted'").fetchall():
-    text=json.loads(payload)['text'];turn=str(uuid.uuid4());reply='已收到 **'+text+'**。\n\n这是模拟器中的测试回复。'
+    value=json.loads(payload)
+    if value.get('kind')=='create':
+     native=str(uuid.uuid4());owner=c.execute('SELECT host FROM commands WHERE id=?',(command,)).fetchone()[0];thread=digest(owner+'\0default\0'+native)
+     c.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,NULL)',(thread,owner,native,'新对话 · '+value['text'][:32],'completed','fixture-new',now,1));c.execute('INSERT INTO thread_projects VALUES(?,?)',(thread,value.get('cursor') or ''));c.execute('INSERT INTO creation_results VALUES(?,?)',(command,thread));c.execute('UPDATE commands SET thread=? WHERE id=?',(thread,command))
+    text=value['text'];turn=str(uuid.uuid4());reply='已收到 **'+text+'**。\n\n这是模拟器中的测试回复。'
     for role,body,offset in [('user',text,0),('assistant',reply,1)]:c.execute('INSERT INTO messages VALUES(?,?,?,?,?,?,?)',(thread,role+':'+command,turn,role,body,digest(body),now*1000+offset))
     c.execute("UPDATE commands SET status='codex_accepted',native_turn=? WHERE id=?",(turn,command));c.execute("UPDATE threads SET revision=?,updated=? WHERE id=?",(turn,now,thread))
     for kind in ['thread','command']:c.execute('INSERT INTO events(kind,thread,created) VALUES(?,?,?)',(kind,thread,now))

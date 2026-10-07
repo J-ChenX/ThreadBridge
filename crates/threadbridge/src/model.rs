@@ -36,6 +36,8 @@ pub struct Thread {
     pub can_send: bool,
     #[serde(default)]
     pub history_cursor: Option<String>,
+    #[serde(default)]
+    pub project: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {

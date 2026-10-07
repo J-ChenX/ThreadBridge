@@ -33,6 +33,7 @@ fn demo(host: &str) -> Snapshot {
             updated_at: now(),
             can_send: true,
             history_cursor: None,
+            project: String::new(),
         },
         messages: vec![ChatMessage {
             id: "welcome".into(),

@@ -283,10 +283,11 @@ pub fn validate_snapshot(raw: &str, destination: &Path, prefix: &str) -> Result<
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<BTreeSet<_>, _>>()?;
         ensure!(
-            TABLES.iter().all(|t| tables.contains(*t)),
+            TABLES[..4].iter().all(|t| tables.contains(*t)),
             "snapshot_schema"
         );
         drop(s);
+        c.execute_batch("CREATE TABLE IF NOT EXISTS captured_projects(thread_id TEXT PRIMARY KEY,project_path TEXT NOT NULL)")?;
         let mut s = c.prepare("SELECT thread_id,turn_id,reply FROM captured_replies")?;
         for row in s.query_map([], |r| {
             Ok((
@@ -579,6 +580,17 @@ pub fn proxy_request(host: &Value, state: &Value, args: &[String]) -> Result<Val
     if args == ["--version"] {
         return Ok(json!({"op":"version"}));
     }
+    if args.len() == 2 && args[0] == "threadbridge-create" {
+        ensure!(
+            state["online"] == true
+                && native_remote::now() - state["last_success"].as_f64().unwrap_or(0.0) <= 10.0,
+            "remote_not_fresh"
+        );
+        let mut request: Value = serde_json::from_str(&args[1])?;
+        ensure!(request["op"] == "create", "proxy_arguments");
+        request["expected_version"] = host["verified_version"].clone();
+        return Ok(request);
+    }
     ensure!(
         args.len() == 5 && args[0] == "queue" && args[1] == "--thread" && args[3] == "--message",
         "proxy_arguments"
@@ -610,10 +622,20 @@ pub async fn proxy(c: &Value, name: &str, config_path: &Path, args: &[String]) -
     let response = rpc(
         host,
         &request,
-        Duration::from_secs(if args == ["--version"] { 4 } else { 12 }),
+        Duration::from_secs(if args == ["--version"] {
+            4
+        } else if args.first().is_some_and(|a| a == "threadbridge-create") {
+            40
+        } else {
+            12
+        }),
     )
     .await?;
-    std::io::stdout().write_all(string(&response, "stdout")?.as_bytes())?;
+    if args.first().is_some_and(|a| a == "threadbridge-create") {
+        std::io::stdout().write_all(&serde_json::to_vec(&response)?)?;
+    } else {
+        std::io::stdout().write_all(string(&response, "stdout")?.as_bytes())?;
+    }
     Ok(())
 }
 async fn systemctl(args: &[&str]) -> Result<Vec<u8>> {
@@ -647,7 +669,9 @@ fn unit_quote(value: &str) -> String {
     )
 }
 pub fn service_template(root: &Path, binary: &Path, config: &Path) -> String {
-    format!("[Unit]\nDescription=ThreadBridge remote capture %i\nPartOf=threadbridge.target\nAfter=threadbridge-phone-hub.service\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} fleet --config {} run %i\nRestart=on-failure\nRestartSec=5\nUMask=0077\nMemoryHigh=128M\nMemoryMax=256M\nKillMode=control-group\n",unit_quote(&root.to_string_lossy()),unit_quote(&binary.to_string_lossy()),unit_quote(&config.to_string_lossy()))
+    // WorkingDirectory is a single literal path, unlike ExecStart's quoted words.
+    let working_directory = root.to_string_lossy().replace('%', "%%");
+    format!("[Unit]\nDescription=ThreadBridge remote capture %i\nPartOf=threadbridge.target\nAfter=threadbridge-phone-hub.service\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={} fleet --config {} run %i\nRestart=on-failure\nRestartSec=5\nUMask=0077\nMemoryHigh=128M\nMemoryMax=256M\nKillMode=control-group\n",working_directory,unit_quote(&binary.to_string_lossy()),unit_quote(&config.to_string_lossy()))
 }
 pub async fn install(c: &Value, config: &Path) -> Result<()> {
     ensure!(cfg!(unix), "systemd_requires_unix");
@@ -1097,10 +1121,11 @@ mod tests {
     #[test]
     fn service_exec_uses_native_fleet_and_quotes_config() {
         let text = service_template(
-            Path::new("/tmp/space dir"),
+            Path::new("/tmp/space %dir"),
             Path::new("/tmp/threadbridge"),
             Path::new("/tmp/private fleet.json"),
         );
+        assert!(text.contains("WorkingDirectory=/tmp/space %%dir\n"));
         assert!(text.contains(
             "ExecStart=\"/tmp/threadbridge\" fleet --config \"/tmp/private fleet.json\" run %i"
         ));

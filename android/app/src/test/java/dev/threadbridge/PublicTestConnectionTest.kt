@@ -23,4 +23,12 @@ class PublicTestConnectionTest {
   assertFalse(PublicTestConnection.matchesHost(listOf(""),""))
   assertTrue(PublicTestConnection.matchesHost(listOf("host"),"host"))
  }
+ @Test fun knownExpiredEntrancesMoveWithoutRedirectingOtherPairings(){
+  val expired="https://expired.example.com"
+  val previous="$old,$expired"
+  assertTrue(PublicTestConnection.shouldMigrate(expired,"token",previous,public,"host"))
+  assertTrue(PublicTestConnection.shouldMigrate(old,"token",previous,public,"host"))
+  assertFalse(PublicTestConnection.shouldMigrate("https://expired.example.com.evil","token",previous,public,"host"))
+  assertFalse(PublicTestConnection.shouldMigrate(public,"token","$previous,$public",public,"host"))
+ }
 }

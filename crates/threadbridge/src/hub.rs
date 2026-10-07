@@ -68,6 +68,14 @@ struct Pair {
     code: String,
     name: String,
 }
+async fn create_thread(
+    State(s): State<Hub>,
+    h: HeaderMap,
+    Json(p): Json<crate::new_threads::CreateSubmit>,
+) -> ApiResult {
+    let device = auth(&h, &s, "phone")?;
+    s.db.submit_new(&device, &p).map(Json).map_err(bad)
+}
 async fn pair(State(s): State<Hub>, Json(p): Json<Pair>) -> ApiResult {
     let mut rate = s.pair_rate.lock().unwrap();
     if now() - rate.0 > 60 {
@@ -91,6 +99,7 @@ async fn health() -> Json<Value> {
 }
 #[derive(Deserialize, Default)]
 struct Paging {
+    q: Option<String>,
     offset: Option<i64>,
     before: Option<i64>,
     before_id: Option<String>,
@@ -144,7 +153,7 @@ async fn capture_health(State(s): State<Hub>, h: HeaderMap) -> ApiResult {
 }
 async fn threads(State(s): State<Hub>, h: HeaderMap, Query(q): Query<Paging>) -> ApiResult {
     auth(&h, &s, "phone")?;
-    s.db.threads(q.offset.unwrap_or(0).clamp(0, 100000))
+    s.db.search_threads(q.offset.unwrap_or(0).clamp(0, 100000), q.q.as_deref())
         .map(Json)
         .map_err(bad)
 }
@@ -293,6 +302,7 @@ pub async fn run(db: Store, listen: &str) -> anyhow::Result<()> {
         .route("/v1/pair", post(pair))
         .route("/v1/hosts", get(hosts))
         .route("/v1/threads", get(threads))
+        .route("/v1/threads/create", post(create_thread))
         .route("/v1/threads/{id}/delete", post(delete_copy))
         .route("/v1/threads/{id}/messages/{msg}/images/{image}", get(image))
         .route("/v1/capture-health", get(capture_health))

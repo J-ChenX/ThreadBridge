@@ -12,10 +12,10 @@ class ConversationReadStateTest {
   assertEquals(setOf("x"),unreadConversations(listOf(original.copy(revision="next")),read))
   assertEquals(setOf("new"),unreadConversations(listOf(original,row("new")),read))
  }
- @Test fun previewHasFiveRecentAndEveryOlderUnread() {
+ @Test fun previewHasThreeRecentAndEveryOlderUnread() {
   val threads=(1..10).map{row("$it",updated=it.toLong())}
   val groups=deviceGroups(listOf(HostRow("a","A",false)),threads,setOf("1","2"))
-  assertEquals(listOf("10","9","8","7","6","2","1"),groups.single().preview.map{it.id})
+  assertEquals(listOf("10","9","8","2","1"),groups.single().preview.map{it.id})
  }
  @Test fun liveMessagesWithUnchangedCompletedTurnStillBecomeUnread() {
   val original=row("x").copy(messageRevision=7,messageActivityAt=1100)

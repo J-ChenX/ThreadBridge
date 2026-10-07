@@ -25,11 +25,12 @@ pub const TOTAL_SCAN: u64 = 128 * 1024 * 1024;
 pub const DB_BYTES: u64 = 32 * 1024 * 1024;
 pub const REQUEST_BYTES: usize = 256 * 1024;
 const MAX_LINE: usize = 4 * 1024 * 1024;
-pub const TABLES: [&str; 4] = [
+pub const TABLES: [&str; 5] = [
     "captured_replies",
     "captured_user_messages",
     "captured_turn_order",
     "captured_request_ids",
+    "captured_projects",
 ];
 #[derive(Args)]
 pub struct RemoteArgs {
@@ -68,6 +69,9 @@ pub fn initialize(database: &Path) -> Result<()> {
     let c = Connection::open(database)?;
     c.busy_timeout(Duration::from_secs(3))?;
     c.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA max_page_count=8192;
+ CREATE TABLE IF NOT EXISTS captured_project_catalog(project_path TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS captured_project_names(project_path TEXT PRIMARY KEY,project_name TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS captured_projects(thread_id TEXT PRIMARY KEY,project_path TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS captured_replies(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,reply TEXT NOT NULL,utf8_bytes INTEGER NOT NULL,captured_at INTEGER NOT NULL,title TEXT NOT NULL DEFAULT '',PRIMARY KEY(thread_id,turn_id));
  CREATE TABLE IF NOT EXISTS captured_request_ids(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,request_id TEXT NOT NULL,PRIMARY KEY(thread_id,turn_id));
  CREATE TABLE IF NOT EXISTS captured_user_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,input_digest TEXT NOT NULL,PRIMARY KEY(thread_id,message_id));
@@ -197,6 +201,7 @@ pub fn poll_limits(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    refresh_projects(database, &index)?;
     let mut total = 0u64;
     for (native, raw, title) in rows {
         if !collection::allowed(database, Some(&index), &native)? || quarantined.contains(&native) {
@@ -327,9 +332,11 @@ pub async fn bounded_process(
     let stdout = child.stdout.take().context("rpc_stdout")?;
     let stderr = child.stderr.take().context("rpc_stderr")?;
     let operation = async {
-        let write = async {
+        let write = async move {
             stdin.write_all(input).await?;
             stdin.shutdown().await?;
+            // ChildStdin must be dropped to close the pipe and deliver EOF.
+            drop(stdin);
             Ok::<(), anyhow::Error>(())
         };
         let read = async {
@@ -374,7 +381,7 @@ pub async fn codex_output(
     limit: usize,
 ) -> Result<String> {
     let mut command = Command::new(&config.codex);
-    command.args(args);
+    command.args(args).env("CODEX_HOME", &config.codex_home);
     Ok(String::from_utf8(
         bounded_process(command, &[], timeout, limit, 65536).await?,
     )?)
@@ -415,6 +422,23 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         )?;
         identity.push(json!([counts.0, counts.1]));
     }
+    let projects: Vec<(String, String)> = c
+        .prepare("SELECT thread_id,project_path FROM captured_projects ORDER BY thread_id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    identity.push(json!(projects));
+    let catalog = c
+        .prepare("SELECT project_path FROM captured_project_catalog ORDER BY project_path")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(catalog));
+    let names = c
+        .prepare(
+            "SELECT project_path,project_name FROM captured_project_names ORDER BY project_path",
+        )?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(names));
     let failures = health::read(database)?;
     identity.push(json!([failures["failures"], failures["overflow"]]));
     let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&identity)?));
@@ -444,6 +468,11 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
     }
     Ok(result)
 }
+/// Only workspace metadata is read; this does not import historical conversations.
+pub fn refresh_projects(database: &Path, index: &Path) -> Result<()> {
+    crate::project_metadata::refresh(database, index)
+}
+
 pub async fn dispatch(config: &RemoteConfig, database: &Path, request: &Value) -> Result<Value> {
     dispatch_with_runner(config, database, request, |args, timeout, limit| {
         let config = config.clone();
@@ -605,6 +634,7 @@ pub async fn handle(config: &RemoteConfig, database: &Path, request: &Value) -> 
         Some("snapshot") => snapshot(config, database, request).await,
         Some("version") => Ok(json!({"schema":1,"stdout":format!("{}\n",version(config).await?)})),
         Some("queue") => dispatch(config, database, request).await,
+        Some("create") => crate::new_threads::create(config, database, request).await,
         Some(op @ ("baseline" | "policy" | "finalize" | "clear")) => reset(
             config,
             database,
@@ -890,6 +920,24 @@ mod tests {
         assert!(db.starts_with(b"SQLite format 3"));
     }
     #[test]
+    fn poll_keeps_registered_root_instead_of_raw_cwd() {
+        let mut f = Fixture::new();
+        let c = Connection::open(&f.index).unwrap();
+        c.execute_batch("ALTER TABLE threads ADD COLUMN cwd TEXT NOT NULL DEFAULT '/code/repo/sub';CREATE TABLE projects(id TEXT,name TEXT);CREATE TABLE project_roots(project_id TEXT,position INTEGER,path TEXT);INSERT INTO projects VALUES('p','真实名称');INSERT INTO project_roots VALUES('p',0,'/code/repo');").unwrap();
+        f.append("done");
+        f.capture();
+        let db = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT project_path FROM captured_projects WHERE thread_id=?1",
+                [&f.native],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "/code/repo"
+        );
+    }
+    #[test]
     fn tail_gap_does_not_advance_watermark() {
         let mut f = Fixture::new();
         let first = f.append("first");
@@ -970,6 +1018,17 @@ mod tests {
         assert!(!first["failures"].as_object().unwrap().is_empty());
         poll_limits(&f.config, &f.db, size, size + 100).unwrap();
         assert_eq!(health::read(&f.db).unwrap(), first);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_receives_eof_before_output_is_collected() {
+        for input in [b"".as_slice(), "RPC 请求正文".as_bytes()] {
+            let output =
+                bounded_process(Command::new("cat"), input, Duration::from_secs(2), 512, 512)
+                    .await
+                    .unwrap();
+            assert_eq!(output, input);
+        }
     }
     #[cfg(unix)]
     #[tokio::test]

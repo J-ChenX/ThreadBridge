@@ -7,6 +7,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Keep this width folding and per-code-point lowercase identical to ConversationSearch.kt.
+fn normalize_search(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(c as u32 - 0xfee0).unwrap(),
+            '\u{3000}' => ' ',
+            _ => c,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Store(pub Arc<Mutex<Connection>>);
 impl Store {
@@ -45,6 +58,11 @@ CREATE TABLE IF NOT EXISTS capture_import_positions(thread TEXT PRIMARY KEY,last
 CREATE TABLE IF NOT EXISTS capture_user_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS attachments(thread TEXT NOT NULL,message TEXT NOT NULL,image TEXT NOT NULL,mime TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(thread,message,image));
 CREATE TABLE IF NOT EXISTS capture_visible_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS thread_projects(thread TEXT PRIMARY KEY,project TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS creation_results(command TEXT PRIMARY KEY,thread TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS project_names(host TEXT NOT NULL,project TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(host,project));
+CREATE TABLE IF NOT EXISTS host_projects(host TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(host,project));
+CREATE TABLE IF NOT EXISTS creation_hosts(host TEXT PRIMARY KEY,last_seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_message_state(thread TEXT PRIMARY KEY,revision INTEGER NOT NULL,activity_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS completion_metadata(thread TEXT NOT NULL,turn TEXT NOT NULL,title TEXT NOT NULL,recorded_at INTEGER NOT NULL,PRIMARY KEY(thread,turn));
 CREATE TABLE IF NOT EXISTS capture_queue_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL,queue_id TEXT);
@@ -171,7 +189,44 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         let mut q = c.prepare(
             "SELECT id,name,last_seen,revoked,expires FROM devices WHERE role='agent' LIMIT 4",
         )?;
-        let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"last_seen":r.get::<_,i64>(2)?,"online":r.get::<_,i64>(2)?>now()-15 && r.get::<_,i64>(3)?==0 && r.get::<_,i64>(4)?>now()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"last_seen":r.get::<_,i64>(2)?,"online":r.get::<_,i64>(2)?>now()-15 && r.get::<_,i64>(3)?==0 && r.get::<_,i64>(4)?>now()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in &mut rows {
+            let id = row["id"].as_str().unwrap_or("");
+            let mut projects = c
+                .prepare(
+                    "SELECT project FROM host_projects WHERE host=?1 ORDER BY project LIMIT 1000",
+                )?
+                .query_map([id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            projects.truncate(100);
+            while serde_json::to_vec(&projects)?.len() > 128 * 1024 {
+                projects.pop();
+            }
+            let mut details = projects
+                .iter()
+                .map(|path| {
+                    let name: String = c
+                        .query_row(
+                            "SELECT name FROM project_names WHERE host=?1 AND project=?2",
+                            params![id, path],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    json!({"path":path,"name":name})
+                })
+                .collect::<Vec<_>>();
+            while serde_json::to_vec(&json!({"projects":projects,"project_details":details}))?.len()
+                > 128 * 1024
+            {
+                projects.pop();
+                details.pop();
+            }
+            row["project_details"] = json!(details);
+            row["projects"] = json!(projects);
+        }
         Ok(json!({"hosts":rows,"collection_generation":generation(&c)?}))
     }
     pub fn snapshot(&self, host: &str, s: &Snapshot) -> Result<()> {
@@ -217,7 +272,9 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             }
         }
         let mut c = self.0.lock().unwrap();
-        let tx = c.transaction()?;
+        // Reserve the writer before reading: a deferred WAL read transaction
+        // cannot upgrade while another process commits, even with busy_timeout.
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if tx.query_row(
             "SELECT count(*)>0 FROM tombstones WHERE thread=?1 AND message=''",
             [&t.id],
@@ -248,6 +305,13 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             .optional()?
             .unwrap_or(t.history_cursor.clone())
         };
+        if !t.project.is_empty() {
+            anyhow::ensure!(
+                t.project.len() <= 2048 && !t.project.contains(['\0', '\n', '\r']),
+                "invalid_project"
+            );
+            tx.execute("INSERT INTO thread_projects VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET project=excluded.project", params![t.id,t.project])?;
+        }
         tx.execute("INSERT INTO threads VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET title=excluded.title,status=excluded.status,revision=excluded.revision,updated=excluded.updated,can_send=excluded.can_send,cursor=excluded.cursor",params![t.id,host,t.native_id,t.title,t.status,t.revision,t.updated_at,t.can_send,history_cursor])?;
         let mut changed = old
             .as_ref()
@@ -305,10 +369,55 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn threads(&self, offset: i64) -> Result<Value> {
+        self.search_threads(offset, None)
+    }
+    pub fn search_threads(&self, offset: i64, query: Option<&str>) -> Result<Value> {
+        anyhow::ensure!(
+            query.is_none_or(|q| q.chars().count() <= 64),
+            "invalid_request"
+        );
+        let needle = normalize_search(query.unwrap_or(""))
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<Vec<_>>();
+        let searching = !needle.is_empty();
         let c = self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0) FROM threads t LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT 50 OFFSET ?1")?;
-        let rows=q.query_map([offset],|r|Ok(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15,"message_revision":r.get::<_,i64>(10)?,"message_activity_at":r.get::<_,i64>(11)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0),coalesce(p.project,''),coalesce(pn.name,''),p.thread IS NOT NULL FROM threads t LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id LEFT JOIN thread_projects p ON p.thread=t.id LEFT JOIN project_names pn ON pn.host=t.host AND pn.project=p.project ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT ?2 OFFSET ?1")?;
+        // Stream title matching in Rust: SQLite's lower() only folds ASCII.
+        // Search never imports message bodies, and follows the same bounded catalogue as sync.
+        let mut iter = q.query(params![
+            if searching { 0 } else { offset },
+            if searching { 100001 } else { 50 }
+        ])?;
+        let mut rows = Vec::new();
+        let mut matched = 0i64;
+        while let Some(r) = iter.next()? {
+            let title = r.get::<_, String>(3)?;
+            if searching {
+                let mut next = 0;
+                for ch in normalize_search(&title).chars() {
+                    if ch == needle[next] {
+                        next += 1;
+                        if next == needle.len() {
+                            break;
+                        }
+                    }
+                }
+                if next != needle.len() {
+                    continue;
+                }
+                matched += 1;
+                if matched <= offset {
+                    continue;
+                }
+            }
+            rows.push(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":title,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15,"message_revision":r.get::<_,i64>(10)?,"message_activity_at":r.get::<_,i64>(11)?,"project":r.get::<_,String>(12)?,"project_name":r.get::<_,String>(13)?,"project_known":r.get::<_,bool>(14)?}));
+            if rows.len() == 50 {
+                break;
+            }
+        }
         let cursor: i64 =
             c.query_row("SELECT COALESCE(MAX(seq),0) FROM events", [], |r| r.get(0))?;
         Ok(
@@ -332,7 +441,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         let mut bytes = 0;
         let mut more = false;
         while let Some(r) = iter.next()? {
-            let row = json!({"id":r.get::<_,String>(0)?,"turn_id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"version":r.get::<_,String>(4)?,"ordinal":r.get::<_,i64>(5)?,"characters":r.get::<_,i64>(6)?,"completion_title":r.get::<_,Option<String>>(7)?,"recorded_at":r.get::<_,Option<i64>>(8)?});
+            let row = json!({"id":r.get::<_,String>(0)?,"turn_id":r.get::<_,String>(1)?,"role":r.get::<_,String>(2)?,"text":r.get::<_,String>(3)?,"version":r.get::<_,String>(4)?,"ordinal":r.get::<_,i64>(5)?,"timestamp_ms":r.get::<_,i64>(5)?,"characters":r.get::<_,i64>(6)?,"completion_title":r.get::<_,Option<String>>(7)?,"recorded_at":r.get::<_,Option<i64>>(8)?});
             let size = serde_json::to_vec(&row)?.len();
             if rows.len() == 30 || (!rows.is_empty() && bytes + size > 256 * 1024) {
                 more = true;
@@ -453,7 +562,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             Self::expire_queued(&tx)?;
             tx.commit()?;
         }
-        self.0.lock().unwrap().query_row("SELECT id,request,status,native_turn,error FROM commands WHERE device=?1 AND (id=?2 OR request=?2)",params![device,id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"request_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"native_turn_id":r.get::<_,Option<String>>(3)?,"error":r.get::<_,Option<String>>(4)?}))).map_err(Into::into)
+        self.0.lock().unwrap().query_row("SELECT id,request,status,native_turn,error,(SELECT thread FROM creation_results WHERE command=commands.id) FROM commands WHERE device=?1 AND (id=?2 OR request=?2)",params![device,id],|r|Ok(json!({"id":r.get::<_,String>(0)?,"request_id":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"native_turn_id":r.get::<_,Option<String>>(3)?,"error":r.get::<_,Option<String>>(4)?,"result_thread_id":r.get::<_,Option<String>>(5)?}))).map_err(Into::into)
     }
     pub fn claim(&self, host: &str) -> Result<Option<Command>> {
         self.claim_source(host, None)
@@ -468,7 +577,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         let row: Option<(String, String)> = if let Some(thread) = target {
             tx.query_row("SELECT id,payload FROM commands WHERE host=?1 AND thread=?2 AND status='accepted' ORDER BY created LIMIT 1",rusqlite::params![host,thread],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
         } else {
-            tx.query_row("SELECT id,payload FROM commands WHERE host=?1 AND status='accepted' AND thread NOT IN (SELECT thread FROM capture_targets) ORDER BY created LIMIT 1",[host],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
+            tx.query_row("SELECT id,payload FROM commands WHERE host=?1 AND status='accepted' AND json_extract(payload,'$.kind')<>'create' AND thread NOT IN (SELECT thread FROM capture_targets) ORDER BY created LIMIT 1",[host],|r|Ok((r.get(0)?,r.get(1)?))).optional()?
         };
         let Some((id, payload)) = row else {
             tx.commit()?;
@@ -588,6 +697,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             "capture_visible_import_positions",
             "attachments",
             "thread_message_state",
+            "thread_projects",
             "resume_owners",
             "outbox",
         ] {

@@ -12,9 +12,11 @@ mod native_input;
 mod native_recovery;
 mod native_remote;
 mod native_resume;
+mod new_threads;
 mod notify;
 #[cfg(unix)]
 mod probe;
+mod project_metadata;
 mod queue;
 mod replica_cleanup;
 mod store;
@@ -86,6 +88,18 @@ enum Commands {
         index: PathBuf,
         #[arg(long)]
         thread: String,
+    },
+    ProjectAlign {
+        #[arg(long)]
+        capture_db: PathBuf,
+        #[arg(long)]
+        native_index: PathBuf,
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        apply: bool,
     },
     CaptureBridge {
         #[arg(long)]
@@ -386,6 +400,27 @@ async fn main() -> Result<()> {
             index,
             thread,
         } => println!("{}", visible_history::backfill(&database, &index, &thread)?),
+        Commands::ProjectAlign {
+            capture_db,
+            native_index,
+            db,
+            host,
+            apply,
+        } => {
+            anyhow::ensure!(
+                capture_db.is_file() && db.is_file(),
+                "existing databases required"
+            );
+            let metadata = project_metadata::read(&native_index)?;
+            println!(
+                "{}",
+                serde_json::json!({"native_threads":metadata.threads.len(),"registered_roots":metadata.names.len(),"assigned_threads":metadata.threads.values().filter(|p|!p.is_empty()).count(),"applied":apply})
+            );
+            if apply {
+                project_metadata::refresh(&capture_db, &native_index)?;
+                capture::import_projects(&Store::open(&db)?, &capture_db, &host)?;
+            }
+        }
         Commands::CaptureBridge {
             db,
             capture_db,

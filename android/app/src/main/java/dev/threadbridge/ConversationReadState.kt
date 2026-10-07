@@ -40,8 +40,11 @@ internal fun conversationReadStamp(thread:ThreadRow)="${thread.updated}:${thread
 internal fun conversationActivity(thread:ThreadRow)=maxOf(thread.updated*1000,thread.messageActivityAt)
 internal fun unreadConversations(threads:List<ThreadRow>,read:Map<String,String>)=threads.filter{read[it.id]!=conversationReadStamp(it)}.map{it.id}.toSet()
 internal data class DeviceGroup(val host:HostRow,val threads:List<ThreadRow>,val preview:List<ThreadRow>,val unread:Boolean)
-internal fun deviceGroups(hosts:List<HostRow>,threads:List<ThreadRow>,unread:Set<String>):List<DeviceGroup> = hosts.map{host->
- val group=threads.filter{it.hostId==host.id}.sortedWith(compareByDescending<ThreadRow>{conversationActivity(it)}.thenBy{it.id})
- val recent=group.take(5).map{it.id}.toSet()
- DeviceGroup(host,group,group.filter{it.id in recent||it.id in unread},group.any{it.id in unread})
+internal fun deviceGroups(hosts:List<HostRow>,threads:List<ThreadRow>,unread:Set<String>,pinned:Set<String> = emptySet()):List<DeviceGroup> {
+ val byHost=threads.groupBy{it.hostId}
+ return hosts.map{host->
+ val group=byHost[host.id].orEmpty().sortedWith(compareByDescending<ThreadRow>{conversationActivity(it)}.thenBy{it.id})
+ val recent=group.groupBy{it.project to it.projectKnown}.values.flatMap{it.take(3)}.map{it.id}.toSet()
+ DeviceGroup(host,group,group.filter{it.id in recent||it.id in unread||it.id in pinned||it.localOnly},group.any{it.id in unread})
 }.sortedWith(compareByDescending<DeviceGroup>{it.threads.firstOrNull()?.let(::conversationActivity)?:Long.MIN_VALUE}.thenBy{it.host.name}.thenBy{it.host.id})
+}

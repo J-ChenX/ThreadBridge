@@ -35,8 +35,8 @@ internal fun Modifier.composerMargins(progress:()->Float)=layout { measurable,co
 internal fun Modifier.composerBodyFrame(progress:()->Float)=layout { measurable,constraints->
  val fraction=progress().coerceIn(0f,1f)
  val minimum=(52.dp.toPx()+(100.dp.toPx()-52.dp.toPx())*fraction).roundToInt()
- val top=(8.dp.toPx()+(16.dp.toPx()-8.dp.toPx())*fraction).roundToInt()
- val bottom=8.dp.roundToPx();val start=18.dp.roundToPx();val end=8.dp.roundToPx()
+ val top=(2.dp.toPx()+(16.dp.toPx()-2.dp.toPx())*fraction).roundToInt()
+ val bottom=(2.dp.toPx()+(8.dp.toPx()-2.dp.toPx())*fraction).roundToInt();val start=18.dp.roundToPx();val end=8.dp.roundToPx()
  val outer=constraints.copy(minHeight=maxOf(constraints.minHeight,minOf(minimum,constraints.maxHeight)))
  val child=measurable.measure(outer.offset(-start-end,-top-bottom))
  layout(outer.constrainWidth(child.width+start+end),outer.constrainHeight(child.height+top+bottom)) {

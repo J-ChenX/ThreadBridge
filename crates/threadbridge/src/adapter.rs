@@ -35,6 +35,14 @@ impl Adapter {
         socket: Option<&Path>,
         verified: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with_home(codex, socket, verified, None).await
+    }
+    pub async fn connect_with_home(
+        codex: &Path,
+        socket: Option<&Path>,
+        verified: Option<&str>,
+        home: Option<&Path>,
+    ) -> Result<Self> {
         let version = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new(codex)
@@ -47,6 +55,9 @@ impl Adapter {
         let allow_send = verified.is_some_and(|v| v == version);
         let mut cmd = tokio::process::Command::new(codex);
         cmd.args(["app-server", "proxy"]);
+        if let Some(home) = home {
+            cmd.env("CODEX_HOME", home);
+        }
         if let Some(socket) = socket {
             cmd.arg("--sock").arg(socket);
         }
@@ -203,6 +214,7 @@ impl Adapter {
                 updated_at: t["updatedAt"].as_i64().unwrap_or(now()),
                 can_send,
                 history_cursor: history["nextCursor"].as_str().map(str::to_string),
+                project: t["cwd"].as_str().unwrap_or("").to_owned(),
             },
             messages,
             initial,

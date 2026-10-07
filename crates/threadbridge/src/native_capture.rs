@@ -160,6 +160,7 @@ fn record(payload: &str, native: &str, options: &CaptureOptions) -> Result<Strin
     if options.store_candidates {
         db.execute_batch("CREATE TABLE IF NOT EXISTS captured_request_candidates(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,request_id TEXT NOT NULL,PRIMARY KEY(thread_id,turn_id,request_id))")?;
     }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS captured_project_catalog(project_path TEXT PRIMARY KEY);CREATE TABLE IF NOT EXISTS captured_projects(thread_id TEXT PRIMARY KEY,project_path TEXT NOT NULL)")?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let columns = {
         let mut query = tx.prepare("PRAGMA table_info(captured_replies)")?;
@@ -170,6 +171,43 @@ fn record(payload: &str, native: &str, options: &CaptureOptions) -> Result<Strin
     };
     if !columns.iter().any(|column| column == "title") {
         tx.execute_batch("ALTER TABLE captured_replies ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
+    }
+    let registered = options
+        .title_index
+        .as_ref()
+        .or(options.user_turn_index.as_ref())
+        .and_then(|p| crate::collection::readonly(p).ok())
+        .and_then(|c| {
+            c.query_row(
+                "SELECT count(*)>0 FROM sqlite_master WHERE name='projects'",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(false);
+    if !registered {
+        if let Some(project) = event["cwd"].as_str().filter(|p| {
+            (p.starts_with('/')
+                || (p.len() > 2
+                    && p.as_bytes()[1] == b':'
+                    && matches!(p.as_bytes()[2], b'\\' | b'/')))
+                && p.len() <= 2048
+                && !p.contains(['\0', '\n', '\r'])
+        }) {
+            tx.execute("INSERT INTO captured_projects VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET project_path=excluded.project_path",params![native,project])?;
+        }
+        if let Some(project) = event["cwd"]
+            .as_str()
+            .filter(|p| p.starts_with('/') || (p.len() > 2 && p.as_bytes()[1] == b':'))
+        {
+            if project.len() <= 2048 && !project.contains(['\0', '\r', '\n']) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO captured_project_catalog VALUES(?1)",
+                    [project],
+                )?;
+            }
+        }
     }
     let old: Option<String> = tx
         .query_row(
@@ -239,12 +277,27 @@ fn record(payload: &str, native: &str, options: &CaptureOptions) -> Result<Strin
     Ok("captured".into())
 }
 
+/// A valid completion can carry no final text (for example an internal follow-up).
+/// Missing or malformed fields still require a capture failure, not this exemption.
+pub(crate) fn empty_completion(event: &Value) -> bool {
+    event["type"] == "agent-turn-complete"
+        && event["turn-id"]
+            .as_str()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && event
+            .get("last-assistant-message")
+            .is_some_and(|reply| reply.is_null() || reply.as_str().is_some_and(str::is_empty))
+}
+
 fn durable_capture(payload: &str, native: &str, options: &CaptureOptions) -> Result<String> {
     uuid::Uuid::parse_str(native).context("invalid_thread_identity")?;
     let event: Value = serde_json::from_str(payload)?;
     ensure!(event.is_object(), "invalid_event");
     if event["thread-id"] != native || event["type"] != "agent-turn-complete" {
         return Ok("ignored".into());
+    }
+    if empty_completion(&event) {
+        return Ok("ignored_empty_reply".into());
     }
     let turn = event["turn-id"]
         .as_str()
@@ -370,6 +423,11 @@ pub fn capture(payload: &str, options: &CaptureOptions) -> Result<String> {
     if !crate::collection::allowed(&options.database, source, native)? {
         return Ok("ignored".into());
     }
+    // These turns may contain only tool results and have no human input either.
+    // Do not turn an explicitly empty completion into a missing-input warning.
+    if empty_completion(&event) {
+        return Ok("ignored_empty_reply".into());
+    }
     let user_error = if let Some(index) = options
         .user_turn_index
         .as_deref()
@@ -448,6 +506,41 @@ mod tests {
         event["type"] = json!("unrelated");
         assert_eq!(execute(&event, &options).unwrap(), "ignored");
         assert!(!options.database.exists());
+    }
+
+    #[test]
+    fn explicit_empty_completion_has_no_reply_or_failure_even_with_input_index() {
+        let root = TempDir::new().unwrap();
+        let mut options = options(&root);
+        let index = root.path().join("index.sqlite");
+        let db = Connection::open(&index).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT,rollout_path TEXT,thread_source TEXT,archived INTEGER)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,'unavailable-rollout.jsonl','user',0)",
+            [N],
+        )
+        .unwrap();
+        options.user_turn_index = Some(index);
+        for empty in [Value::Null, json!("")] {
+            let mut event = event();
+            event["last-assistant-message"] = empty;
+            assert_eq!(execute(&event, &options).unwrap(), "ignored_empty_reply");
+            assert!(!options.database.exists());
+            assert!(!crate::health::path(&options.database).exists());
+        }
+        let mut event = event();
+        event
+            .as_object_mut()
+            .unwrap()
+            .remove("last-assistant-message");
+        assert!(execute(&event, &options).is_err());
+        assert_eq!(failure(&options), "missing_reply_identity");
+        event["last-assistant-message"] = Value::Null;
+        event["turn-id"] = json!("invalid");
+        assert!(execute(&event, &options).is_err());
     }
 
     #[test]
