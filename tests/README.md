@@ -18,11 +18,13 @@ python3 tests/run.py --unit-only
 python3 tests/run.py --integration-only --binary target/release/threadbridge
 ```
 
-CI 在 Python 3.10 与 3.14 分别执行完整回归。集成测试调用原生 capture/resume CLI；mock 子进程使用所选 Python。Rust 模块单元测试在 Linux/Windows 运行，发送和进程所有权 fixture 只使用隔离模拟器，未证明任意真实 Codex 或四机长期运行。
+CI 使用 Python 3.14 执行回归。集成测试调用原生 capture/resume CLI；mock 子进程使用所选 Python。Rust 模块单元测试在 Linux/Windows 运行，发送和进程所有权 fixture 只使用隔离模拟器，未证明任意真实 Codex 或四机长期运行。
 
 installed proxy 的 Rust fixture 默认忽略，它依赖本机 Codex CLI；单独运行仍只操作隔离 socket。常规 CI 不依赖该 CLI。
 
 常规 Rust fixture 通过符号链接运行固定 mock 文件，临时目录只写数据，避免并行创建并执行脚本时的 `Text file busy`；mock 使用 PATH 中选定的 Python。
+
+`test_thread_titles.py` 验证原生名称经采集、远端快照和 Hub 到达手机 HTTP API，单独改名推进刷新事件，重放幂等，并验证本机名称同步、原 ID/消息修订/未读时间保持及无命令或完成通知。Rust 单元回归补充旧版名称索引、缺失字段、UTF-8 长名称与发现窗口之外的旧副本更新。
 
 ## Android 像素预览
 

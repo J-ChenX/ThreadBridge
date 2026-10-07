@@ -187,9 +187,11 @@ mod tests {
         std::fs::create_dir_all(&git).unwrap();
         std::fs::create_dir_all(tree.join("sub/deep")).unwrap();
         std::fs::write(tree.join(".git"), format!("gitdir: {}", git.display())).unwrap();
+        let root = worktree_root(tree.join("sub/deep").to_str().unwrap()).unwrap();
+        // Windows may expand an 8.3 temp path and change its separators.
         assert_eq!(
-            worktree_root(tree.join("sub/deep").to_str().unwrap()),
-            Some(repo.to_str().unwrap().into())
+            Path::new(&root).canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
         );
         assert_eq!(
             git_worktree_repository("\\\\?\\C:\\code\\repo\\.git\\worktrees\\slot"),

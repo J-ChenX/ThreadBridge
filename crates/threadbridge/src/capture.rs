@@ -536,8 +536,10 @@ pub async fn sync_catalog(
     anyhow::ensure!(valid, "capture_requires_existing_authorized_host");
     let mut fingerprints = std::collections::BTreeMap::new();
     loop {
+        let mut title_refresh_failed = false;
         if let Some(index) = &native_index {
             let _ = crate::native_remote::refresh_projects(&source, index);
+            title_refresh_failed = crate::thread_titles::refresh(&source, index).is_err();
         }
         let _ = import_projects(&db, &source, &host);
         let selected = if all_captured {
@@ -569,6 +571,9 @@ pub async fn sync_catalog(
             titles.clone()
         };
         let mut health=read_health(&source).unwrap_or_else(|_|serde_json::json!({"failures":{},"overflow":false,"projection_error":"capture_status_unavailable"}));
+        if title_refresh_failed {
+            health["projection_error"] = serde_json::json!("title_projection_failed");
+        }
         if !all_captured {
             if let Some(failures) = health
                 .get_mut("failures")

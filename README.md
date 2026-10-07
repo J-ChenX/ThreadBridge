@@ -20,7 +20,7 @@
 
 ## 构建与验证
 
-Rust 工具链固定为 1.98.1；Rust 单元回归在 Linux/Windows 运行，独立 Python 集成测试仅使用标准库，CI 覆盖 3.10 与 3.14；Android 使用 JDK 17、SDK 35 和 Gradle Wrapper 8.11.1。
+Rust 工具链固定为 1.98.1；Rust 单元回归在 Linux/Windows 运行，独立 Python 集成测试仅使用标准库，CI 使用 Python 3.14；Android 使用 JDK 17、SDK 35 和 Gradle Wrapper 8.11.1。
 
 ```sh
 cargo test --workspace --locked

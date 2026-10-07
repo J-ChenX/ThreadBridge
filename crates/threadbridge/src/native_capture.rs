@@ -58,8 +58,16 @@ pub(crate) fn read_bounded_line(stream: &mut impl BufRead, limit: usize) -> Resu
 }
 
 pub fn indexed_title(native: &str, index: &Path) -> Result<Option<String>> {
+    Ok(read_indexed_titles(index, Some(native))?.remove(native))
+}
+
+pub fn indexed_titles(index: &Path) -> Result<BTreeMap<String, String>> {
+    read_indexed_titles(index, None)
+}
+
+fn read_indexed_titles(index: &Path, selected: Option<&str>) -> Result<BTreeMap<String, String>> {
     let mut stream = BufReader::new(File::open(index)?);
-    let mut found = None;
+    let mut found = BTreeMap::new();
     let mut used = 0;
     loop {
         let line = read_bounded_line(&mut stream, 8192)?;
@@ -79,7 +87,10 @@ pub fn indexed_title(native: &str, index: &Path) -> Result<Option<String>> {
                 .all(|key| ["id", "thread_name", "updated_at"].contains(&key.as_str())),
             "invalid_title_index_metadata"
         );
-        if entry.get("id").and_then(Value::as_str) == Some(native) {
+        if let Some(native) = entry.get("id").and_then(Value::as_str) {
+            if selected.is_some_and(|id| id != native) {
+                continue;
+            }
             let title = entry
                 .get("thread_name")
                 .and_then(Value::as_str)
@@ -88,7 +99,7 @@ pub fn indexed_title(native: &str, index: &Path) -> Result<Option<String>> {
                 !title.trim().is_empty() && title.len() <= 512,
                 "invalid_title"
             );
-            found = Some(title.trim().to_owned());
+            found.insert(native.to_owned(), title.trim().to_owned());
         }
     }
     Ok(found)
@@ -144,6 +155,12 @@ fn record(payload: &str, native: &str, options: &CaptureOptions) -> Result<Strin
     let title = options
         .title
         .clone()
+        .or_else(|| {
+            options
+                .user_turn_index
+                .as_deref()
+                .and_then(|index| crate::thread_titles::read(index).ok()?.remove(native))
+        })
         .or_else(|| {
             options
                 .title_index

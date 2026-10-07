@@ -73,6 +73,38 @@ fn submit(s: &Snapshot) -> Submit {
     }
 }
 #[test]
+fn rename_emits_one_refresh_without_marking_messages_unread_or_notifying() {
+    let (_dir, db, host, _phone, mut s) = setup();
+    s.thread.status = "completed".into();
+    db.snapshot(&host, &s).unwrap();
+    let before = db.events(0).unwrap()["cursor"].as_i64().unwrap();
+    let message_state = db.threads(0).unwrap()["threads"][0].clone();
+    s.initial = false;
+    s.thread.title = "Actual name".into();
+    db.snapshot(&host, &s).unwrap();
+    let renamed = db.threads(0).unwrap()["threads"][0].clone();
+    assert_eq!(renamed["title"], "Actual name");
+    assert_eq!(renamed["revision"], message_state["revision"]);
+    assert_eq!(
+        renamed["message_revision"],
+        message_state["message_revision"]
+    );
+    assert_eq!(
+        renamed["message_activity_at"],
+        message_state["message_activity_at"]
+    );
+    assert_eq!(db.events(0).unwrap()["cursor"], before + 1);
+    db.snapshot(&host, &s).unwrap();
+    assert_eq!(db.events(0).unwrap()["cursor"], before + 1);
+    assert_eq!(
+        db.0.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
 fn visible_message_state_survives_replay_reopen_and_same_timestamp_updates() {
     let (dir, db, host, _phone, mut s) = setup();
     let completed_revision = s.thread.revision.clone();

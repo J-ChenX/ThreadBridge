@@ -282,17 +282,17 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         )? {
             return Ok(());
         }
-        let old: Option<(String, String)> = tx
+        let old: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT status,revision FROM threads WHERE id=?1",
+                "SELECT status,revision,title FROM threads WHERE id=?1",
                 [&t.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let history_cursor = if s.history
             || old
                 .as_ref()
-                .is_some_and(|(_, revision)| revision != &t.revision)
+                .is_some_and(|(_, revision, _)| revision != &t.revision)
         {
             tx.execute("INSERT INTO history_positions VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET cursor=excluded.cursor",params![t.id,t.history_cursor])?;
             t.history_cursor.clone()
@@ -340,7 +340,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         if message_changed {
             tx.execute("INSERT INTO thread_message_state VALUES(?1,1,?2) ON CONFLICT(thread) DO UPDATE SET revision=revision+1,activity_at=max(activity_at,excluded.activity_at)",params![t.id,activity_at])?;
         }
-        if changed {
+        if changed || old.as_ref().is_some_and(|x| x.2 != t.title) {
             tx.execute(
                 "INSERT INTO events(kind,thread,created) VALUES('thread',?1,?2)",
                 params![t.id, now()],

@@ -39,6 +39,7 @@ def main():
             ('test_resume_phone.py', []),
             ('test_resume_phone.py', ['--worker']),
             ('test_conversation_sync.py', []),
+            ('test_thread_titles.py', []),
             ('test_capture_correlation.py', []),
             ('test_subagent_cleanup.py', []),
             ('test_capture_health_scope.py', []),

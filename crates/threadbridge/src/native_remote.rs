@@ -191,19 +191,14 @@ pub fn poll_limits(
         .collect();
     let c = readonly(&index)?;
     let mut statement =
-        c.prepare("SELECT id,rollout_path,title FROM threads ORDER BY updated_at DESC LIMIT 200")?;
+        c.prepare("SELECT id,rollout_path FROM threads ORDER BY updated_at DESC LIMIT 200")?;
     let rows = statement
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     refresh_projects(database, &index)?;
+    let titles = crate::thread_titles::refresh(database, &index)?;
     let mut total = 0u64;
-    for (native, raw, title) in rows {
+    for (native, raw) in rows {
         if !collection::allowed(database, Some(&index), &native)? || quarantined.contains(&native) {
             continue;
         }
@@ -260,7 +255,7 @@ pub fn poll_limits(
                     thread: None,
                     catalog: None,
                     all_tasks: true,
-                    title: None,
+                    title: titles.get(&native).cloned(),
                     title_index: None,
                     user_turn_index: Some(index.clone()),
                     storage_budget: Some(DB_BYTES),
@@ -273,16 +268,6 @@ pub fn poll_limits(
                     result == "captured" || result == "duplicate",
                     "capture_unconfirmed"
                 );
-                let display = title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .map(|t| t.chars().take(150).collect::<String>())
-                    .unwrap_or_else(|| format!("会话 · {}", &native[..8]));
-                Connection::open(database)?.execute(
-                    "UPDATE captured_replies SET title=? WHERE thread_id=? AND turn_id=?",
-                    params![display, native, event["turn-id"].as_str()],
-                )?;
                 latest = latest.max(*stamp);
                 confirmed = event["turn-id"].as_str().map(str::to_owned);
                 processed += 1;
@@ -439,6 +424,17 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     identity.push(json!(names));
+    let titles = c
+        .prepare("SELECT thread_id,turn_id,title FROM captured_replies ORDER BY thread_id,turn_id")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(titles));
     let failures = health::read(database)?;
     identity.push(json!([failures["failures"], failures["overflow"]]));
     let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&identity)?));
@@ -918,6 +914,94 @@ mod tests {
             .read_to_end(&mut db)
             .unwrap();
         assert!(db.starts_with(b"SQLite format 3"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_repairs_existing_turns_and_changes_snapshot_without_new_messages() {
+        let mut f = Fixture::new();
+        let index = Connection::open(&f.index).unwrap();
+        index.execute_batch("ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET title='# Files mentioned by the user:',name='Actual name'").unwrap();
+        f.append("human");
+        f.capture();
+        f.append("second turn");
+        f.capture();
+        f.config.codex = "/bin/echo".into();
+        let first = snapshot(&f.config, &f.db, &json!({})).await.unwrap();
+        let capture = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            capture
+                .query_row(
+                    "SELECT count(*) FROM captured_replies WHERE title='Actual name'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let messages: Vec<(String, String)> = capture
+            .prepare("SELECT turn_id,reply FROM captured_replies ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let fingerprint_before = fingerprint(&f.path).unwrap();
+        capture
+            .execute("UPDATE captured_replies SET title='wrong old title'", [])
+            .unwrap();
+        index
+            .execute("UPDATE threads SET name='Renamed conversation'", [])
+            .unwrap();
+        let renamed = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(renamed["changed"], true);
+        assert_ne!(renamed["revision"], first["revision"]);
+        assert_eq!(
+            capture
+                .query_row(
+                    "SELECT count(*) FROM captured_replies WHERE title='Renamed conversation'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let after: Vec<(String, String)> = capture
+            .prepare("SELECT turn_id,reply FROM captured_replies ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(messages, after);
+        assert_eq!(fingerprint_before, fingerprint(&f.path).unwrap());
+        let repeated = snapshot(&f.config, &f.db, &json!({"revision":renamed["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(repeated["changed"], false);
+    }
+
+    #[test]
+    fn rename_refreshes_old_replicas_outside_the_recent_discovery_window() {
+        let mut f = Fixture::new();
+        f.append("human");
+        f.capture();
+        let index = Connection::open(&f.index).unwrap();
+        index.execute_batch("ALTER TABLE threads ADD COLUMN name TEXT;ALTER TABLE threads ADD COLUMN thread_source TEXT;UPDATE threads SET name='Older renamed thread'").unwrap();
+        for _ in 0..201 {
+            index.execute("INSERT INTO threads(id,rollout_path,title,updated_at,thread_source) VALUES(?1,'missing rollout','internal',2,'subagent')", [Uuid::new_v4().to_string()]).unwrap();
+        }
+        f.capture();
+        assert_eq!(f.count(), 1);
+        assert_eq!(
+            Connection::open(&f.db)
+                .unwrap()
+                .query_row("SELECT title FROM captured_replies", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Older renamed thread"
+        );
     }
     #[test]
     fn poll_keeps_registered_root_instead_of_raw_cwd() {

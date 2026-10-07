@@ -22,6 +22,7 @@ mod replica_cleanup;
 mod store;
 #[cfg(test)]
 mod tests;
+mod thread_titles;
 mod visible_history;
 use anyhow::Result;
 use clap::{Parser, Subcommand};

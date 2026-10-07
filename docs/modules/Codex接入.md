@@ -31,6 +31,8 @@ M04 将已完成轮次、用户输入与发送回执转换为 ThreadBridge 投�
 
 身份有效且完成通知明确携带 null 或空字符串最终回复时，没有正文需要保存，返回 `ignored_empty_reply`，不创建正文或缺失用户输入告警；缺失字段、非法身份仍报告错误。历史回填仅在同一轮次同时具有空的 `final_answer`、无错误且明确为空的 `task_complete.last_agent_message`，并且没有已保存正文时，清除旧的 `missing_reply_identity` 误报。其他失败保留，手机刷新只能重新读取电脑状态，无法自行修复采集错误。
 
+对话名称优先读取原生 SQLite 的 `threads.name`，为空或旧版没有该列时读取同目录 `session_index.jsonl` 的 `thread_name`，最后兼容旧 `title`；附件包装文字不作为旧标题使用，无可用名称时显示短 ID。轮询和本机 `capture-sync --native-index` 独立刷新已采集对话的名称，包括最近 200 个发现窗口之外的旧副本，不要求新消息或完成轮次。名称进入远端快照 revision；Hub 对单独改名发布列表刷新事件，保持消息修订、活动时间与未读标记，不产生完成通知。手机无需更新 APK，但本机与远端采集二进制均须升级。
+
 通知入口和远端读取均受 `collection.rs` 的 cutoff、排除 ID、删除 ID 和 generation 约束。跨进程锁串行保护策略变更与捕获；策略无法核对时停止。可见历史回填只将源记录中明确 `final_answer` 且匹配 `task_complete.last_agent_message` 的成功轮次补入最终回复，不推测未完成结果。
 
 通知路径通过 `native_input.rs` 读取明确完成的当前轮次人类输入。图片消息要求所有内容项均带有人类元数据，支持重复文字项，剔除界面的附件包装文字；系统附加内容与工具结果不作为人类输入。读取失败时助手正文仍保存，健康状态说明用户消息缺失。`captured_user_messages` 与 `captured_turn_order` 支持准确顺序；Hub 在用户输入晚于回复到达时重新关联。
