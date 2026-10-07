@@ -1,0 +1,124 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish (for example v0.1.21-test)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-apk
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate tag and find the previous APK release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] || { echo 'Invalid version tag' >&2; exit 1; }
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > /dev/null
+          gh api "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          releases = json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text())
+          tag = os.environ["RELEASE_TAG"]
+          if any(release["tag_name"] == tag for release in releases):
+              raise SystemExit("Release already exists; refusing to replace published assets")
+          previous = next((release["tag_name"] for release in releases
+                           if not release["draft"] and any(asset["name"].endswith(".apk")
+                                                          for asset in release["assets"])), "")
+          if previous and not re.fullmatch(r"v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?", previous):
+              raise SystemExit("Previous release has an unsupported tag")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"tag={previous}\n")
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+      - name: Restore the original signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.THREADBRIDGE_KEYSTORE_BASE64 }}
+          KEY_PASSWORD: ${{ secrets.THREADBRIDGE_KEY_PASSWORD }}
+          SIGNER_SHA256: ${{ secrets.THREADBRIDGE_SIGNER_SHA256 }}
+        run: |
+          : "${KEYSTORE_BASE64:?Missing keystore secret}"
+          : "${KEY_PASSWORD:?Missing signing password secret}"
+          : "${SIGNER_SHA256:?Missing original certificate fingerprint}"
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/threadbridge.jks"
+      - name: Test, lint and build the public signed APK
+        env:
+          THREADBRIDGE_KEYSTORE: ${{ runner.temp }}/threadbridge.jks
+          THREADBRIDGE_KEY_PASSWORD: ${{ secrets.THREADBRIDGE_KEY_PASSWORD }}
+          THREADBRIDGE_PUBLIC_TEST_SERVER: ''
+          THREADBRIDGE_PUBLIC_TEST_PREVIOUS_SERVER: ''
+          THREADBRIDGE_PUBLIC_TEST_HOST: ''
+        run: scripts/build-apk.sh
+      - name: Verify version, signature and upgrade compatibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNER_SHA256: ${{ secrets.THREADBRIDGE_SIGNER_SHA256 }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          apk="artifacts/ThreadBridge-${version%-test}.apk"
+          previous_args=()
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            mkdir -p "$RUNNER_TEMP/previous"
+            gh release download "$PREVIOUS_TAG" --pattern '*.apk' --dir "$RUNNER_TEMP/previous"
+            previous_apks=("$RUNNER_TEMP/previous/"*.apk)
+            [[ ${#previous_apks[@]} -eq 1 ]] || { echo 'Expected one previous APK' >&2; exit 1; }
+            previous_args=(--previous "${previous_apks[0]}")
+          fi
+          python3 scripts/verify-release.py "$apk" --expected-version "$version" --signer-sha256 "$SIGNER_SHA256" "${previous_args[@]}"
+          (cd artifacts && sha256sum --check "ThreadBridge-${version%-test}.apk.sha256")
+      - name: Publish APK and checksum to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          apk="artifacts/ThreadBridge-${version%-test}.apk"
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          下载附件 APK，在 Android 8.0 及以上设备安装。已有版本可直接覆盖升级。
+
+          公开安装包不预置个人服务器地址，请配对自己的 ThreadBridge Hub。电脑端也需使用匹配版本；安装 APK 不会升级电脑服务。
+
+          本安装包经 JVM 测试、Release Lint、签名、16 KiB 对齐及版本检查。SHA-256 校验文件与 APK 一同提供。
+          EOF
+          prerelease_args=()
+          if [[ "$version" == *-* ]]; then
+            prerelease_args=(--prerelease --latest=false)
+            printf '\n当前为测试版本，真机验收与长期稳定性仍在验证。\n' >> "$RUNNER_TEMP/release-notes.md"
+          fi
+          gh release create "$RELEASE_TAG" "$apk" "$apk.sha256" --verify-tag --generate-notes \
+            --title "ThreadBridge $version" --notes-file "$RUNNER_TEMP/release-notes.md" "${prerelease_args[@]}"
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/threadbridge.jks"

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私密报告）
+    url: https://github.com/J-ChenX/ThreadBridge/security/advisories/new
+    about: 鉴权、数据泄露和其他安全问题，请勿公开披露。
+  - name: 安装与配置文档
+    url: https://github.com/J-ChenX/ThreadBridge/blob/main/docs/运行与安装.md
+    about: APK 安装、Hub 配置、配对、备份和恢复。

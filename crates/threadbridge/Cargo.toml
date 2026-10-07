@@ -3,6 +3,10 @@ name = "threadbridge"
 version = "0.1.0"
 edition = "2021"
 publish = false
+description = "Self-hosted bridge for viewing and continuing Codex conversations on Android"
+license = "MIT"
+repository = "https://github.com/J-ChenX/ThreadBridge"
+readme = "../../README.md"
 
 [dependencies]
 anyhow = "1"

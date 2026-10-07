@@ -17,5 +17,5 @@ release_apk="artifacts/ThreadBridge-${release_version%-test}.apk"
 "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose android/app/build/outputs/apk/release/app-release.apk
 "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 4 android/app/build/outputs/apk/release/app-release.apk
 cp android/app/build/outputs/apk/release/app-release.apk "$release_apk"
-sha256sum "$release_apk" > "$release_apk.sha256"
+(cd artifacts && sha256sum "${release_apk#artifacts/}" > "${release_apk#artifacts/}.sha256")
 printf 'Verified APK: %s\n' "$release_apk"

@@ -30,6 +30,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("apk", type=pathlib.Path)
     parser.add_argument("--previous", type=pathlib.Path)
+    parser.add_argument("--expected-version", help="Require the APK versionName to match the release tag")
+    parser.add_argument("--signer-sha256", help="Require the original signing certificate SHA-256")
     parser.add_argument("--sdk", type=pathlib.Path, default=os.environ.get("ANDROID_HOME"))
     args = parser.parse_args()
     if args.sdk is None:
@@ -37,6 +39,10 @@ def main():
     current = inspect(args.apk, args.sdk)
     if current["package"] != "dev.threadbridge":
         raise ValueError("Release must use dev.threadbridge (no debug suffix)")
+    if args.expected_version and current["version"] != args.expected_version:
+        raise ValueError("APK versionName does not match the release tag")
+    if args.signer_sha256 and current["signer_sha256"].lower() != args.signer_sha256.lower():
+        raise ValueError("APK does not use the original signing certificate")
     if args.previous:
         prior = inspect(args.previous, args.sdk)
         if prior["package"] != current["package"] or prior["signer_sha256"] != current["signer_sha256"]:

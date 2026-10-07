@@ -1,0 +1,38 @@
+name: Bug 报告
+description: 提交可以复现的安装、同步或界面问题
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: 请先搜索已有问题。安全漏洞请使用私密安全报告，不要上传凭证、真实对话或数据库。
+  - type: input
+    id: versions
+    attributes:
+      label: 版本与环境
+      description: APK 版本、电脑端提交或版本、Codex 版本、Android/电脑系统版本
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 使用合成数据描述最小复现步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏日志或截图（可选）
+      description: 删除访问密钥、配对码、真实地址、个人路径和对话内容；不要上传完整数据库。

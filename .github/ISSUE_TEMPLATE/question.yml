@@ -1,0 +1,18 @@
+name: 使用问题
+description: 咨询安装、配置和兼容性
+title: '[Question] '
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: 版本与环境
+      description: APK、电脑端、Codex 及操作系统版本
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: 问题与已尝试的方法
+      description: 请勿包含访问密钥、配对码或私密对话。
+    validations:
+      required: true
