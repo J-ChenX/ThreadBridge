@@ -272,7 +272,10 @@ mod tests {
         let path = root.path().join("an image.png");
         let png = b"\x89PNG\r\n\x1a\nfixture";
         std::fs::write(&path, png).unwrap();
-        let text=format!("before ![result](<{}>) after\n`![code]({})`\n```\n![code]({})\n```\n![remote](https://example.test/private.png)",path.display(),path.display(),path.display());
+        // Markdown treats backslashes before punctuation as escapes. Use forward
+        // slashes so Windows temporary paths such as Temp\.tmp... stay intact.
+        let markdown_path = path.to_string_lossy().replace('\\', "/");
+        let text=format!("before ![result](<{markdown_path}>) after\n`![code]({markdown_path})`\n```\n![code]({markdown_path})\n```\n![remote](https://example.test/private.png)");
         let mut db = Connection::open_in_memory().unwrap();
         capture(&mut db, "n", "native:m", &text).unwrap();
         let rendered = render(&db, "n", "native:m", &text).unwrap();
@@ -294,9 +297,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("oversized.png");
         std::fs::write(&path, vec![0; IMAGE_BYTES + 1]).unwrap();
+        let markdown_path = path.to_string_lossy().replace('\\', "/");
         let text = format!(
-            "![large]({})\n![missing](/missing.png)\n![svg](data:image/svg+xml;base64,PHN2Zz4=)",
-            path.display()
+            "![large](<{markdown_path}>)\n![missing](/missing.png)\n![svg](data:image/svg+xml;base64,PHN2Zz4=)"
         );
         let mut db = Connection::open_in_memory().unwrap();
         capture(&mut db, "n", "notify:t", &text).unwrap();
