@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS capture_import_positions(thread TEXT PRIMARY KEY,last
 CREATE TABLE IF NOT EXISTS capture_user_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS attachments(thread TEXT NOT NULL,message TEXT NOT NULL,image TEXT NOT NULL,mime TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(thread,message,image));
 CREATE TABLE IF NOT EXISTS capture_visible_import_positions(thread TEXT PRIMARY KEY,last_row INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS desktop_thread_origins(owner TEXT NOT NULL,host TEXT NOT NULL,native TEXT NOT NULL,PRIMARY KEY(owner,host,native));
+CREATE INDEX IF NOT EXISTS desktop_origin_lookup ON desktop_thread_origins(host,native,owner);
+CREATE TABLE IF NOT EXISTS desktop_project_catalog(owner TEXT NOT NULL,host TEXT NOT NULL,path TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(owner,host,path));
+CREATE TABLE IF NOT EXISTS desktop_project_assignments(owner TEXT NOT NULL,host TEXT NOT NULL,native TEXT NOT NULL,path TEXT NOT NULL,PRIMARY KEY(owner,host,native));
+CREATE INDEX IF NOT EXISTS desktop_project_lookup ON desktop_project_assignments(host,native,owner);
+CREATE VIEW IF NOT EXISTS resolved_desktop_projects AS SELECT a.host,a.native,min(a.path) AS path,min(p.name) AS name FROM desktop_project_assignments a JOIN desktop_project_catalog p ON p.owner=a.owner AND p.host=a.host AND p.path=a.path GROUP BY a.host,a.native HAVING count(DISTINCT a.owner)=1;
+CREATE TABLE IF NOT EXISTS thread_tasks(thread TEXT PRIMARY KEY,turn_id TEXT NOT NULL,status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_projects(thread TEXT PRIMARY KEY,project TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS creation_results(command TEXT PRIMARY KEY,thread TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS project_names(host TEXT NOT NULL,project TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(host,project));
@@ -78,6 +85,12 @@ CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,thread TEXT NOT NULL,statu
 CREATE TABLE IF NOT EXISTS history_positions(thread TEXT PRIMARY KEY,cursor TEXT);
 CREATE TABLE IF NOT EXISTS tombstones(thread TEXT NOT NULL,message TEXT NOT NULL,PRIMARY KEY(thread,message));
 CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL,native_turn TEXT,error TEXT);")?;
+        // A collection generation can be shared by fresh hubs ("initial").
+        // Bind endpoint changes to a separate identity without resetting legacy data.
+        c.execute(
+            "INSERT OR IGNORE INTO settings(k,v) VALUES('hub_id',?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
         let initialized: bool = c.query_row(
             "SELECT count(*)>0 FROM settings WHERE k='message_state_initialized'",
             [],
@@ -107,6 +120,44 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         }
         Ok(Self(Arc::new(Mutex::new(c))))
     }
+    /// Display ownership is independent from the immutable execution host/native key.
+    pub fn desktop_origins(&self, owner: &str, origins: &[(String, String)]) -> Result<()> {
+        anyhow::ensure!(origins.len() <= 5000, "origin_limit");
+        uuid::Uuid::parse_str(owner)?;
+        for (host, native) in origins {
+            uuid::Uuid::parse_str(host)?;
+            uuid::Uuid::parse_str(native)?;
+        }
+        let mut c = self.0.lock().unwrap();
+        let tx = c.transaction()?;
+        let previous = tx.prepare("SELECT host,native FROM desktop_thread_origins WHERE owner=?1 ORDER BY host,native")?
+            .query_map([owner], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let wanted = origins
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if previous
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            != wanted
+        {
+            tx.execute("DELETE FROM desktop_thread_origins WHERE owner=?1", [owner])?;
+            for (host, native) in wanted {
+                tx.execute(
+                    "INSERT INTO desktop_thread_origins VALUES(?1,?2,?3)",
+                    params![owner, host, native],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO events(kind,thread,created) VALUES('metadata','',?1)",
+                [now()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn credential(&self, role: &str, name: &str) -> Result<(String, String)> {
         let id = uuid::Uuid::new_v4().to_string();
         let token = secret();
@@ -166,7 +217,9 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             params![id, hash(&token), name, now() + 90 * 86400],
         )?;
         tx.commit()?;
-        Ok(json!({"device_id":id,"token":token,"expires_at":now()+90*86400,"protocol":PROTOCOL}))
+        Ok(
+            json!({"device_id":id,"token":token,"expires_at":now()+90*86400,"protocol":PROTOCOL,"hub_id":hub_identity(&c)?}),
+        )
     }
     pub fn revoke(&self, id: &str) -> Result<()> {
         let mut c = self.0.lock().unwrap();
@@ -187,7 +240,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
     pub fn hosts(&self) -> Result<Value> {
         let c = self.0.lock().unwrap();
         let mut q = c.prepare(
-            "SELECT id,name,last_seen,revoked,expires FROM devices WHERE role='agent' LIMIT 4",
+            "SELECT id,name,last_seen,revoked,expires FROM devices WHERE role='agent' ORDER BY (revoked=0 AND expires>strftime('%s','now')) DESC,rowid DESC LIMIT 4",
         )?;
         let mut rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"last_seen":r.get::<_,i64>(2)?,"online":r.get::<_,i64>(2)?>now()-15 && r.get::<_,i64>(3)?==0 && r.get::<_,i64>(4)?>now()})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &mut rows {
@@ -227,7 +280,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             row["project_details"] = json!(details);
             row["projects"] = json!(projects);
         }
-        Ok(json!({"hosts":rows,"collection_generation":generation(&c)?}))
+        Ok(json!({"hosts":rows,"collection_generation":generation(&c)?,"hub_id":hub_identity(&c)?}))
     }
     pub fn snapshot(&self, host: &str, s: &Snapshot) -> Result<()> {
         self.snapshot_source(host, s, None)
@@ -264,7 +317,12 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             bail!("invalid_snapshot")
         }
         for m in &s.messages {
-            if !["user", "assistant"].contains(&m.role.as_str())
+            if m.role == "question" {
+                let q: crate::questions::Question = serde_json::from_str(&m.text)?;
+                q.validate()?;
+                anyhow::ensure!(m.id == q.message_id(), "invalid_question_identity");
+            }
+            if !["user", "assistant", "question"].contains(&m.role.as_str())
                 || m.text.len() > 256 * 1024
                 || m.id.len() > 256
             {
@@ -384,7 +442,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             .collect::<Vec<_>>();
         let searching = !needle.is_empty();
         let c = self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0),coalesce(p.project,''),coalesce(pn.name,''),p.thread IS NOT NULL FROM threads t LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id LEFT JOIN thread_projects p ON p.thread=t.id LEFT JOIN project_names pn ON pn.host=t.host AND pn.project=p.project ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT ?2 OFFSET ?1")?;
+        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0),coalesce(dp.path,p.project,''),coalesce(dp.name,pn.name,''),(dp.path IS NOT NULL OR p.thread IS NOT NULL),coalesce(ts.turn_id,''),coalesce(ts.status,'unknown'),coalesce((SELECT min(o.owner) FROM desktop_thread_origins o WHERE o.host=t.host AND o.native=t.native HAVING count(DISTINCT o.owner)=1),t.host) FROM threads t LEFT JOIN thread_tasks ts ON ts.thread=t.id LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id LEFT JOIN resolved_desktop_projects dp ON dp.host=t.host AND dp.native=t.native LEFT JOIN thread_projects p ON p.thread=t.id LEFT JOIN project_names pn ON pn.host=t.host AND pn.project=p.project ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT ?2 OFFSET ?1")?;
         // Stream title matching in Rust: SQLite's lower() only folds ASCII.
         // Search never imports message bodies, and follows the same bounded catalogue as sync.
         let mut iter = q.query(params![
@@ -413,7 +471,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
                     continue;
                 }
             }
-            rows.push(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":title,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15,"message_revision":r.get::<_,i64>(10)?,"message_activity_at":r.get::<_,i64>(11)?,"project":r.get::<_,String>(12)?,"project_name":r.get::<_,String>(13)?,"project_known":r.get::<_,bool>(14)?}));
+            rows.push(json!({"id":r.get::<_,String>(0)?,"native_id":r.get::<_,String>(1)?,"host_id":r.get::<_,String>(2)?,"title":title,"status":r.get::<_,String>(4)?,"revision":r.get::<_,String>(5)?,"updated_at":r.get::<_,i64>(6)?,"can_send":r.get::<_,bool>(7)? && r.get::<_,i64>(9)?>now()-15,"history_cursor":r.get::<_,Option<String>>(8)?,"host_online":r.get::<_,i64>(9)?>now()-15,"message_revision":r.get::<_,i64>(10)?,"message_activity_at":r.get::<_,i64>(11)?,"project":r.get::<_,String>(12)?,"project_name":r.get::<_,String>(13)?,"project_known":r.get::<_,bool>(14)?,"task_turn_id":r.get::<_,String>(15)?,"task_status":r.get::<_,String>(16)?,"display_host_id":r.get::<_,String>(17)?}));
             if rows.len() == 50 {
                 break;
             }
@@ -515,6 +573,9 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             bail!("revision_conflict")
         }
         let capture_ready: bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM capture_targets WHERE host=(SELECT host FROM threads WHERE id=?1)) OR EXISTS(SELECT 1 FROM capture_targets WHERE thread=?1 AND queue_enabled=1 AND last_seen>?2)", rusqlite::params![s.thread_id,now()-15], |r|r.get(0))?;
+        if s.kind == "send" {
+            crate::questions::validate_reply(&tx, "messages", &s.thread_id, &s.text)?;
+        }
         if s.kind == "send" && !capture_ready {
             bail!("not_ready")
         }
@@ -698,6 +759,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             "attachments",
             "thread_message_state",
             "thread_projects",
+            "thread_tasks",
             "resume_owners",
             "outbox",
         ] {
@@ -747,6 +809,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
         } else {
             tx.execute("DELETE FROM messages WHERE thread=?1", [&thread])?;
             tx.execute("DELETE FROM threads WHERE id=?1", [&thread])?;
+            tx.execute("DELETE FROM thread_tasks WHERE thread=?1", [&thread])?;
             tx.execute(
                 "DELETE FROM thread_message_state WHERE thread=?1",
                 [&thread],
@@ -784,4 +847,71 @@ fn generation(c: &Connection) -> Result<String> {
         [],
         |r| r.get(0),
     )?)
+}
+
+fn hub_identity(c: &Connection) -> Result<String> {
+    Ok(c.query_row("SELECT v FROM settings WHERE k='hub_id'", [], |r| r.get(0))?)
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    #[test]
+    fn display_ownership_preserves_execution_identity_and_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("hub.sqlite")).unwrap();
+        let owner = uuid::Uuid::new_v4().to_string();
+        let execution = uuid::Uuid::new_v4().to_string();
+        let native = uuid::Uuid::new_v4().to_string();
+        let id = key(&execution, &native);
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO threads VALUES(?1,?2,?3,'SSH task','completed','unchanged',42,0,NULL)",
+                params![id, execution, native],
+            )
+            .unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO thread_message_state VALUES(?1,7,123)", [&id])
+            .unwrap();
+        store
+            .desktop_origins(&owner, &[(execution.clone(), native.clone())])
+            .unwrap();
+        let row = &store.threads(0).unwrap()["threads"][0];
+        assert_eq!(row["display_host_id"], owner);
+        assert_eq!(row["host_id"], execution);
+        assert_eq!(row["native_id"], native);
+        assert_eq!(row["id"], id);
+        assert_eq!(row["revision"], "unchanged");
+        assert_eq!(row["message_revision"], 7);
+        let cursor = store.threads(0).unwrap()["cursor"].clone();
+        store
+            .desktop_origins(&owner, &[(execution.clone(), native.clone())])
+            .unwrap();
+        assert_eq!(store.threads(0).unwrap()["cursor"], cursor);
+        // Ambiguous desktop claims fall back to physical execution, never guess.
+        let other = uuid::Uuid::new_v4().to_string();
+        store
+            .desktop_origins(&other, &[(execution.clone(), native)])
+            .unwrap();
+        assert_eq!(
+            store.threads(0).unwrap()["threads"][0]["display_host_id"],
+            execution
+        );
+        store.desktop_origins(&other, &[]).unwrap();
+        assert_eq!(
+            store.threads(0).unwrap()["threads"][0]["display_host_id"],
+            owner
+        );
+        store.desktop_origins(&owner, &[]).unwrap();
+        assert_eq!(
+            store.threads(0).unwrap()["threads"][0]["display_host_id"],
+            execution
+        );
+    }
 }

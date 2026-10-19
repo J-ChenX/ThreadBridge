@@ -26,6 +26,7 @@ def main():
     if not args.integration_only:
         subprocess.run(['cargo', 'test', '--workspace', '--locked'], cwd=ROOT, env=env, check=True)
     if not args.unit_only:
+        run(ROOT / 'tests/test_release_policy.py')
         binary = args.binary.resolve()
         if not binary.is_file():
             parser.error('Build the release binary first: cargo build --release --locked')
@@ -46,9 +47,11 @@ def main():
             ('test_capture_empty_reply.py', []),
             ('test_archived_cleanup.py', []),
             ('test_visible_history.py', []),
+            ('test_questions.py', []),
             ('test_android_migrations.py', []),
             ('test_create_conversation.py', []),
             ('test_project_alignment.py', []),
+            ('test_desktop_projects.py', []),
             ('test_runtime_alignment.py', []),
         ]
         for name, extra in cases:

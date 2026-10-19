@@ -78,6 +78,21 @@ pub fn load(path: &Path) -> Result<Value> {
     ensure!((1..=4).contains(&hosts.len()), "host_count");
     for (name, host) in hosts {
         ensure!(validate_name(name), "host_name");
+        if let Some(mapping) = host.get("desktop_remote_hosts") {
+            let mapping = mapping
+                .as_object()
+                .context("desktop_remote_hosts_invalid")?;
+            ensure!(mapping.len() <= 32, "desktop_remote_hosts_limit");
+            for (alias, target) in mapping {
+                ensure!(
+                    alias.len() <= 256 && alias.starts_with("remote-ssh-"),
+                    "desktop_remote_alias"
+                );
+                let target = target.as_str().context("desktop_remote_target")?;
+                let target_host = hosts.get(target).context("desktop_remote_target")?;
+                Uuid::parse_str(string(target_host, "host_id")?)?;
+            }
+        }
         if host["local"] == true {
             continue;
         }
@@ -306,6 +321,9 @@ pub fn validate_snapshot(raw: &str, destination: &Path, prefix: &str) -> Result<
             "UPDATE captured_replies SET title=? || substr(title,1,160)",
             [format!("{prefix} · ")],
         )?;
+        if c.query_row("SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_thread_titles'", [], |r| r.get::<_, bool>(0))? {
+            c.execute("UPDATE captured_thread_titles SET title=? || substr(title,1,160)", [format!("{prefix} · ")])?;
+        }
         drop(c);
         replace(&tmp, destination)
     })();
@@ -335,10 +353,14 @@ pub fn queue_snapshot(source: &Path, destination: &Path, blocked: &[String]) -> 
     let mut db = Connection::open(&tmp)?;
     db.execute_batch("PRAGMA journal_mode=DELETE;")?;
     let tx = db.transaction()?;
-    for table in TABLES
-        .into_iter()
-        .chain(["captured_images", "captured_visible_messages"])
-    {
+    for table in TABLES.into_iter().chain([
+        "captured_images",
+        "captured_assistant_images",
+        "captured_visible_messages",
+        "captured_questions",
+        "captured_task_state",
+        "captured_thread_titles",
+    ]) {
         if !tx.query_row(
             "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
             [table],
@@ -446,6 +468,37 @@ async fn cycle(
         Duration::from_secs(if revision.is_none() { 45 } else { 10 }),
     )
     .await?;
+
+    if let Some(origins) = response["desktop_remote_threads"].as_object() {
+        ensure!(origins.len() <= 5000, "origin_limit");
+        let mut resolved = Vec::new();
+        for (native, alias) in origins {
+            Uuid::parse_str(native)?;
+            let Some(target) = alias
+                .as_str()
+                .and_then(|alias| host["desktop_remote_hosts"][alias].as_str())
+            else {
+                continue;
+            };
+            let target_host = string(&c["hosts"][target], "host_id")?;
+            Uuid::parse_str(target_host)?;
+            resolved.push((target_host.to_owned(), native.clone()));
+        }
+        crate::store::Store::open(Path::new(string(c, "hub_db")?))?
+            .desktop_origins(string(host, "host_id")?, &resolved)?;
+    }
+
+    // Metadata is carried even on unchanged body snapshots and survives offline peers.
+    if let Some(projects) = response.get("desktop_projects") {
+        let projects =
+            crate::desktop_projects::resolve(serde_json::from_value(projects.clone())?, c, host)?;
+        crate::desktop_projects::replace(
+            &crate::store::Store::open(Path::new(string(c, "hub_db")?))?,
+            string(host, "host_id")?,
+            projects,
+        )?;
+    }
+
     let enabled = host["verified_version"]
         .as_str()
         .is_some_and(|v| !v.is_empty() && response["version"] == v)
@@ -937,11 +990,15 @@ mod tests {
         assert!(validate_snapshot(&encode(b"invalid"), &destination, "host").is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"previous");
         validate_snapshot(&encode(&fs::read(backup).unwrap()), &destination, "host").unwrap();
-        let title: String = Connection::open(destination)
-            .unwrap()
+        let replica = Connection::open(destination).unwrap();
+        let title: String = replica
             .query_row("SELECT title FROM captured_replies", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "host · 测试对话");
+        let live_title: String = replica
+            .query_row("SELECT title FROM captured_thread_titles", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live_title, "host · 测试对话");
     }
     #[test]
     fn snapshot_expansion_and_trailing_data_rejected() {

@@ -6,6 +6,14 @@ object CapturePresentation {
   detail.contains("尚未确认保存")||detail.contains("未保存正文")->"部分回复尚未确认保存"
   else->"同步状态尚未确认"
  }
+ fun projectionReason(code:String)=when(code){
+  "visible_history_projection_failed"->"部分对话历史读取失败，已保存内容保留；电脑采集恢复后自动重试。"
+  "title_projection_failed"->"对话标题同步失败。"
+  "completion_projection_failed"->"已捕获回复写入同步服务失败。"
+  "capture_source_unavailable"->"电脑回复库暂不可读取。"
+  "capture_status_unavailable"->"电脑保存状态暂不可读取。"
+  else->"电脑采集或同步暂不可用。"
+ }
  fun reason(code:String)=when(code){
   "user_input_capture_failed"->"用户消息尚未同步，助手回复已保存"
   "disk_space_low"->"电脑磁盘余量不足"

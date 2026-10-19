@@ -59,6 +59,8 @@ with tempfile.TemporaryDirectory(prefix='threadbridge-smoke-') as tmp:
         pairing=json.loads(subprocess.check_output([binary,'pair','--db',db,'--url',base]))
         code,result=request(base,'/v1/pair',data={'code':pairing['code'],'name':'Smoke phone'})
         assert code==200;token=result['token'];phone=result['device_id']
+        hub_identity=result['hub_id'];assert str(uuid.UUID(hub_identity))==hub_identity
+        assert request(base,'/v1/hosts',token)[1]['hub_id']==hub_identity
         assert request(base,'/v1/pair',data={'code':pairing['code'],'name':'Replay'})[0]==409
         agent=subprocess.Popen([binary,'agent','--config',cfg,'--db',root/'agent.sqlite','--demo'],stdout=log,stderr=log)
         thread=eventually(lambda:request(base,'/v1/threads',token)[1]['threads'][0])
@@ -93,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix='threadbridge-smoke-') as tmp:
         hub.terminate();hub.wait(timeout=5)
         hub=subprocess.Popen([binary,'hub','--db',db,'--listen',f'127.0.0.1:{port}'],stdout=log,stderr=log)
         eventually(lambda:request(base,'/health')[0]==200)
+        assert request(base,'/v1/hosts',token)[1]['hub_id']==hub_identity
         agent=subprocess.Popen([binary,'agent','--config',cfg,'--db',root/'agent.sqlite','--demo'],stdout=log,stderr=log)
         eventually(lambda:request(base,'/v1/threads',token)[1]['threads'][0]['host_online'])
         assert request(base,'/v1/commands/'+payload['request_id'],token)[1]['native_turn_id']==receipt['native_turn_id']

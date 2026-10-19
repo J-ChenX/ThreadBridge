@@ -6,10 +6,17 @@ val releaseConnection = Properties().apply {
  val config = rootProject.file("../local/release-connection.properties")
  if (config.isFile) config.inputStream().use { load(it) }
 }
+val androidRelease = Properties().apply {
+ rootProject.file("release.properties").inputStream().use { load(it) }
+}
+val releaseVersion = requireNotNull(androidRelease.getProperty("versionName"))
+val releaseVersionCode = requireNotNull(androidRelease.getProperty("versionCode")).toInt()
+require(releaseVersion.matches(Regex("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)"))) { "Release version must have no test/debug suffix" }
+require(releaseVersionCode > requireNotNull(androidRelease.getProperty("publishedVersionCode")).toInt()) { "Candidate versionCode must exceed the published release" }
 android {
  namespace = "dev.threadbridge"
  compileSdk = 35
- defaultConfig { applicationId = "dev.threadbridge"; minSdk = 26; targetSdk = 35; versionCode = 22; versionName = "0.1.21-test" }
+ defaultConfig { applicationId = requireNotNull(androidRelease.getProperty("applicationId")); minSdk = 26; targetSdk = 35; versionCode = releaseVersionCode; versionName = releaseVersion }
  defaultConfig {
   for (field in listOf("PUBLIC_TEST_SERVER", "PUBLIC_TEST_PREVIOUS_SERVER", "PUBLIC_TEST_HOST")) {
    val value = System.getenv("THREADBRIDGE_$field") ?: releaseConnection.getProperty(field, "")
@@ -21,7 +28,7 @@ android {
  compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
  kotlinOptions { jvmTarget = "17" }
  signingConfigs { create("personal") { val key = System.getenv("THREADBRIDGE_KEYSTORE"); if (key != null) { storeFile = file(key); storePassword = System.getenv("THREADBRIDGE_KEY_PASSWORD"); keyAlias = "threadbridge"; keyPassword = System.getenv("THREADBRIDGE_KEY_PASSWORD") } } }
- buildTypes { getByName("release") { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("personal") }; getByName("debug") { applicationIdSuffix = ".debug" } }
+ buildTypes { getByName("release") { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("personal") }; getByName("debug") { applicationIdSuffix = ".debug"; versionNameSuffix = "-debug" } }
 }
 ksp { arg("room.schemaLocation", "$projectDir/schemas") }
 dependencies {

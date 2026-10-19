@@ -15,3 +15,10 @@ internal fun imageGesture(value:ImageTransform,zoom:Float,panX:Float,panY:Float,
  val scale=(value.scale*zoom).coerceIn(1f,5f);val ratio=scale/value.scale
  return constrainImage(ImageTransform(scale,value.x*ratio+(focusX-width/2)*(1-ratio)+panX,value.y*ratio+(focusY-height/2)*(1-ratio)+panY),width,height,imageWidth,imageHeight)
 }
+
+/** Hit-test the transformed fitted image, leaving letterboxed space dismissible. */
+internal fun imageContains(value:ImageTransform,x:Float,y:Float,width:Float,height:Float,imageWidth:Float,imageHeight:Float):Boolean {
+ if(width<=0||height<=0||imageWidth<=0||imageHeight<=0)return false
+ val fit=min(width/imageWidth,height/imageHeight)*value.scale
+ return kotlin.math.abs(x-width/2-value.x)<=imageWidth*fit/2 && kotlin.math.abs(y-height/2-value.y)<=imageHeight*fit/2
+}

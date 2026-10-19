@@ -43,7 +43,9 @@ python3 scripts/android_preview.py
 
 resume worker 集成在 mock 轮次进行中发送 SIGINT，确认最终捕获、回执和租约释放完成后退出。
 
-`test_visible_history.py` 验证图片人类消息、重复文字项、进行中过程说明、原始排序、最终回复去重、图片接口鉴权和副本清理；工具/推理不进入消息。`ConversationAttachmentsTest` 验证附件标记与正文分离。可见历史集成检查同一时间戳的新过程说明推进消息变化标记、完成轮次 ID 保持不变、重放不推进及清理状态；主页 JVM 检查进行中消息未读、毫秒级排序与旧已读格式兼容。清理集成覆盖缺失/损坏策略提前拒绝且不创建备份；Rust 恢复检查 18 MiB 图片摘要与图片改动后计划失效。`test_android_migrations.py` 用真实声明的迁移 SQL 验证 Room 1/2/3/4/5→6 与导出 schema 一致，并保留旧缓存和草稿；不替代真机升级验收。
+`test_visible_history.py` 验证图片人类消息、重复文字项、进行中过程说明、原始排序、最终回复去重、图片接口鉴权和副本清理；工具/推理不进入消息。`ConversationAttachmentsTest` 验证附件标记与正文分离。可见历史集成检查同一时间戳的新过程说明推进消息变化标记、完成轮次 ID 保持不变、重放不推进及清理状态；主页 JVM 检查进行中消息未读、毫秒级排序与旧已读格式兼容。清理集成覆盖缺失/损坏策略提前拒绝且不创建备份；Rust 恢复检查 18 MiB 图片摘要与图片改动后计划失效。`test_android_migrations.py` 用声明的迁移 SQL 验证 Room 1～8 及两种已交付 Room 7 形态进入 Room 9，与导出 schema 一致，保留所有旧字段、缓存、草稿和未确认请求，并拒绝版本低于已保存的历史 schema；不替代实际签名包升级验收。
+
+启动升级回归：`python3 tests/android/qa_android_startup_upgrade.py --serial emulator-5554 artifacts/ThreadBridge-<version>.apk` 只允许专用、可 root 的模拟器。先安装实际签名包并确认启动，再分别覆盖安装历史 1.0.1、1.0.2、1.0.3 和当前候选包；期间使用离线合成数据库，检查实际 Room 打开、Activity 可见、重复冷启动，以及每个历史字段、消息、草稿、未确认请求和连接偏好保持。先与隔离合成 Hub 配对后增加 `--require-paired`，要求所有升级前后都直接显示设备列表与缓存对话，并保留加密连接偏好。测试不卸载应用、不访问生产服务、不发送上游命令；结束恢复模拟器网络。历史 1.0.2 的真实缓存版本为 8，不能以仓库当时的版本 6/7 代替正式 APK 的数据库事实。API 35 与 Android 16/API 36 均执行此回归。
 
 安装当前签名包后运行 `python3 tests/android/qa_visible_history.py`，在专用模拟器验证图片缩略图、用户正文、过程说明、最终回复、图片预览与重启缓存，不发送真实对话。
 
@@ -64,3 +66,19 @@ qa_android_ui016_boundaries.py 验证跨项目及跨设备时主页/侧边栏固
 0.1.21：`ConnectionConfigurationTest` 验证 HTTPS/私人 IP、嵌入凭证/查询参数/错误端口拒绝、空密钥沿用、请求头注入拒绝及不同 collection 隔离。`qa_android_settings021.py` 在实际签名 APK 和合成 Hub 上验证设置取消、空密钥切换地址、错误密钥和不同库拒绝、新密钥显示/隐藏和加密保存、同库缓存/草稿保留、重新配对确认，以及深色/375dp 两倍字体/横屏/关闭动画；不发送远端命令，生产凭证与生产库不参与测试。固定公网入口需独立核对保留记录、正常 DNS/TLS 无凭证鉴权响应、单服务重启后地址仍一致和原其他隧道继续运行。
 
 `qa_android_keyentry021.py` 另使用没有现存数据的独立 debug 包，验证首次地址/密钥连接直接进入主页且侧边栏关闭、未经过配对交换、重启后加密凭证可用以及命令数不变；结束删除该测试包及合成手机身份，实际签名 release 包的数据不受影响。
+
+2026-10-10：创建回归覆盖没有桌面控制 socket 时的 stdio 初始化、thread/name/set 落盘后再 queue、创建/落盘回执丢失时不重发与不可用执行器在意图前拒绝。实际 CLI 使用隔离 CODEX_HOME 和拒绝连接的 loopback 模型服务验证新 ID 未落盘时 queue 拒绝、命名落盘后 queue 接收，不触发真实模型调用。ConversationScopeTest 验证设备/项目批量已读覆盖旧折叠项、主机与未知项目隔离、新消息重新未读；回执测试验证未知提交清空输入与明确拒绝保留输入。
+
+`qa_android_bulk_read_delete.py` 使用新安装的独立 debug 包、专用模拟器和合成 Hub/HTTP 代理，验证分组已读、重启保存、新消息重新未读、多选取消、批量删除部分失败与重试、未知发送清空输入、明确拒绝保留输入及成功创建 ID 切换；小屏深色/2 倍字体/关闭动画与横屏截图输出至忽略的 artifacts/。运行前启动 qa_android_fixture018.py，不使用生产凭证，不调用真实模型。
+
+服务身份回归：Rust `hub_identity_is_unique_persistent_and_does_not_reset_legacy_data` 与 `integration/smoke.py` 验证真实配对、主机列表和重启均返回一致 `hub_id`，用于阻止新手机包搭配缺少身份接口的服务端发布。
+
+压缩记录回归覆盖 `.jsonl` 转 `.jsonl.zst` 后的完成水位、原生用户消息、可见过程、幂等与健康失败自动恢复；解压字节预算、会话身份和目录边界必须继续拒绝不合法来源。Windows 安装目录回归验证同一安装目录的唯一候选发现与歧义拒绝，发现路径不授予新版本写权限。
+
+交互问题：`test_questions.py` 使用隔离原生记录、真实 loopback Hub/HTTP 验证首条最终回复之前的问题投影、选项、原问题 ID 回复、不可变请求去重、电脑回答后状态同步、过期问题拒绝和删除后不重建。Rust `questions::tests` 检查工具白名单、人类元数据、异步 ACK 不代表回答、独立多问题、阻塞响应、未完成源不回退已回答状态；远端测试检查问题状态进入 snapshot revision 和清理保留原始文件。`qa_android_questions.py` 使用实际 debug APK 与临时合成 Hub，在专用模拟器验证显示、选项/回答、入列不提前完成、重启和自适应布局；仅生成一次明确合成命令，不访问生产服务。
+
+发布门禁：`python3 tests/test_release_policy.py` 使用标准库和隔离的构建/SDK fixture 验证版本源回退、测试后缀、错误包名、debuggable、错误签名/基线哈希、版本与文件名不一致、缺失上一版、检查失败不生成正式 APK，以及不可覆盖已有产物。成功路径须经过 JVM、assembleRelease/lintRelease、正式验收和完整的版本化 APK/校验值/报告输出。runner 的集成入口和 CI 都执行此回归；Android CI 另用真实 SDK 检查实际 debug APK 的内部版本，避免 Gradle 与版本源漂移。模拟工具不替代正式签名及覆盖升级验收。
+
+远程桌面项目：`desktop_projects::tests` 覆盖服务器项目为空时使用发起端明确归属、执行主机映射隔离、项目改名/删除、多桌面冲突、状态损坏保留、重复同步幂等及正文/原 ID/消息活动/请求不变；`desktop_project_changes_are_sent_even_without_body_changes` 验证没有正文变化和数据库下载时，新项目与名称变化仍进入真实 snapshot RPC。`test_desktop_projects.py` 使用固定合成 SSH 响应和真实 fleet/Hub/手机 HTTP 接口，验证正文快照未变化时的分类、改名、旧 helper 缺字段时保留、明确移除、原执行身份与消息活动不变；不登录真实主机，不提交命令。
+
+`python3 tests/android/qa_android_images_status.py` 使用专用模拟器、实际 debug APK 和临时合成 HTTP 服务检查图片首次读取、同步阻塞时内存命中、进程重启后磁盘命中、点击空白关闭、精确原图下载、运行/完成/离线状态、具体健康告警及恢复；同时记录小屏深色大字号、关闭动画、横屏和平板截图。不会连接生产服务或提交命令。

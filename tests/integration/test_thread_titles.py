@@ -140,7 +140,20 @@ def main():
                 assert c.execute('SELECT count(*) FROM outbox').fetchone()[0] == 0
                 assert c.execute('SELECT count(*) FROM commands').fetchone()[0] == 0
             assert not (root / 'calls').exists(), 'no native send or creation is allowed'
-            print('PASS native name -> snapshot -> Hub/phone API; rename without messages; local metadata refresh; stable IDs/read state; replay; no send or notification')
+            # Desktop display ownership must survive the real phone API without
+            # changing native/execution identity, message state or send availability.
+            previous = get('/v1/threads')['threads'][0]
+            assert previous['display_host_id'] == host
+            owner = str(uuid.uuid4())
+            with sqlite3.connect(hubdb) as c:
+                c.execute('INSERT INTO desktop_thread_origins VALUES(?,?,?)', (owner, host, native))
+            displayed = get('/v1/threads')['threads'][0]
+            assert displayed['display_host_id'] == owner
+            for field in ['id', 'native_id', 'host_id', 'revision', 'updated_at',
+                          'message_revision', 'message_activity_at', 'can_send', 'host_online']:
+                assert displayed[field] == previous[field], field
+            assert get(f'/v1/threads/{tid}/messages') == messages
+            print('PASS native name -> snapshot -> Hub/phone API; rename without messages; local metadata refresh; stable IDs/read state; replay; desktop display ownership preserves execution; no send or notification')
         finally:
             if sync is not None:
                 sync.terminate()

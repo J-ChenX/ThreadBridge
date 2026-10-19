@@ -20,11 +20,15 @@ use tokio::{
     process::Command,
 };
 use uuid::Uuid;
-pub const TAIL_BYTES: u64 = 16 * 1024 * 1024;
+// Keep a complete maximum-size image record and its preceding completion in
+// the polling window, so 16–20 MiB records do not lose the confirmed anchor.
+pub const TAIL_BYTES: u64 = 32 * 1024 * 1024;
 pub const TOTAL_SCAN: u64 = 128 * 1024 * 1024;
 pub const DB_BYTES: u64 = 32 * 1024 * 1024;
 pub const REQUEST_BYTES: usize = 256 * 1024;
-const MAX_LINE: usize = 4 * 1024 * 1024;
+const MAX_METADATA_LINE: usize = 4 * 1024 * 1024;
+const MAX_LINE: usize = crate::native_input::MAX_LINE;
+const VISIBLE_HISTORY_VERSION: u64 = 4;
 pub const TABLES: [&str; 5] = [
     "captured_replies",
     "captured_user_messages",
@@ -43,6 +47,53 @@ pub struct RemoteConfig {
     pub codex_home: PathBuf,
     pub verified_version: Option<String>,
 }
+#[cfg(any(windows, test))]
+fn relocated_windows_codex(configured: &Path) -> Result<PathBuf> {
+    let bin = configured
+        .parent()
+        .and_then(Path::parent)
+        .context("codex_install_layout")?;
+    let named = |path: &Path, name: &str| {
+        path.file_name()
+            .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(name))
+    };
+    ensure!(
+        named(configured, "codex.exe")
+            && named(bin, "bin")
+            && bin.parent().is_some_and(
+                |p| named(p, "Codex") && p.parent().is_some_and(|p| named(p, "OpenAI"))
+            ),
+        "codex_install_layout"
+    );
+    let mut candidates = Vec::new();
+    for (position, entry) in fs::read_dir(bin)?.enumerate() {
+        ensure!(position < 32, "codex_install_catalog_limit");
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() == 16
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && entry.file_type()?.is_dir()
+            && entry.path().join("codex.exe").is_file()
+        {
+            candidates.push(entry.path().join("codex.exe"));
+        }
+    }
+    ensure!(candidates.len() == 1, "codex_install_ambiguous_or_missing");
+    Ok(candidates.remove(0))
+}
+pub fn load_config(path: &Path) -> Result<RemoteConfig> {
+    let config: RemoteConfig = serde_json::from_slice(&fs::read(path)?)?;
+    #[cfg(windows)]
+    let config = {
+        let mut config = config;
+        if !config.codex.exists() {
+            config.codex = relocated_windows_codex(&config.codex)?;
+        }
+        config
+    };
+    Ok(config)
+}
 pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -50,7 +101,7 @@ pub fn now() -> f64 {
         .as_secs_f64()
 }
 pub fn fingerprint(path: &Path) -> Result<Value> {
-    let m = fs::metadata(path)?;
+    let m = fs::metadata(crate::rollout::resolve(path)?)?;
     let t = m.modified()?.duration_since(UNIX_EPOCH)?;
     Ok(json!([m.len(), t.as_nanos() as u64]))
 }
@@ -75,7 +126,10 @@ pub fn initialize(database: &Path) -> Result<()> {
  CREATE TABLE IF NOT EXISTS captured_replies(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,reply TEXT NOT NULL,utf8_bytes INTEGER NOT NULL,captured_at INTEGER NOT NULL,title TEXT NOT NULL DEFAULT '',PRIMARY KEY(thread_id,turn_id));
  CREATE TABLE IF NOT EXISTS captured_request_ids(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,request_id TEXT NOT NULL,PRIMARY KEY(thread_id,turn_id));
  CREATE TABLE IF NOT EXISTS captured_user_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,input_digest TEXT NOT NULL,PRIMARY KEY(thread_id,message_id));
+ CREATE TABLE IF NOT EXISTS captured_visible_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(thread_id,message_id));
+ CREATE TABLE IF NOT EXISTS captured_task_state(thread_id TEXT PRIMARY KEY,turn_id TEXT NOT NULL,status TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS captured_turn_order(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,completed_at INTEGER NOT NULL,PRIMARY KEY(thread_id,turn_id));")?;
+    crate::questions::initialize(&c)?;
     if !health::path(database).exists() {
         health::update(database, "initial", "initial", None, None)?;
     }
@@ -86,28 +140,46 @@ pub fn backup(source: &Path, destination: &Path) -> Result<()> {
     c.backup(rusqlite::DatabaseName::Main, destination, None)?;
     Ok(())
 }
+#[cfg(test)]
 pub fn completed_events(
     path: &Path,
     native: &str,
     home: &Path,
     tail_bytes: u64,
 ) -> Result<(Vec<(i64, Value)>, u64)> {
-    let resolved = path.canonicalize()?;
+    completed_source(path, native, home, tail_bytes, None)
+}
+pub(crate) fn completed_source(
+    path: &Path,
+    native: &str,
+    home: &Path,
+    tail_bytes: u64,
+    source: Option<&mut crate::rollout::Source>,
+) -> Result<(Vec<(i64, Value)>, u64)> {
+    let resolved = crate::rollout::resolve(path)?.canonicalize()?;
     let allowed = ["sessions", "archived_sessions"].into_iter().any(|n| {
         home.join(n)
             .canonicalize()
             .is_ok_and(|r| resolved.starts_with(r))
     });
     ensure!(allowed, "rollout_path_outside_sessions");
-    let file = fs::File::open(&resolved)?;
-    let size = file.metadata()?.len();
+    let mut owned;
+    let file = match source {
+        Some(source) => source,
+        None => {
+            owned = crate::rollout::Source::open(&resolved, TOTAL_SCAN)?;
+            &mut owned
+        }
+    };
+    let size = file.len();
+    let cost = file.scan_cost(tail_bytes);
     let mut stream = BufReader::new(file);
     let mut line = Vec::new();
     stream
         .by_ref()
-        .take((MAX_LINE + 1) as u64)
+        .take((MAX_METADATA_LINE + 1) as u64)
         .read_until(b'\n', &mut line)?;
-    ensure!(line.len() <= MAX_LINE, "session_metadata_limit");
+    ensure!(line.len() <= MAX_METADATA_LINE, "session_metadata_limit");
     let metadata: Value = serde_json::from_slice(&line)?;
     ensure!(
         metadata["type"] == "session_meta" && metadata["payload"]["id"] == native,
@@ -156,7 +228,7 @@ pub fn completed_events(
             events.push((stamp,json!({"type":"agent-turn-complete","thread-id":native,"turn-id":turn,"last-assistant-message":reply})));
         }
     }
-    Ok((events, size.min(tail_bytes)))
+    Ok((events, cost))
 }
 pub fn poll(config: &RemoteConfig, database: &Path) -> Result<()> {
     poll_limits(config, database, TAIL_BYTES, TOTAL_SCAN)
@@ -196,9 +268,12 @@ pub fn poll_limits(
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     refresh_projects(database, &index)?;
-    let titles = crate::thread_titles::refresh(database, &index)?;
+    let titles = crate::thread_titles::read(&index)?;
     let mut total = 0u64;
     for (native, raw) in rows {
+        if total >= total_scan {
+            break;
+        }
         if !collection::allowed(database, Some(&index), &native)? || quarantined.contains(&native) {
             continue;
         }
@@ -206,7 +281,6 @@ pub fn poll_limits(
         let attempt = (|| -> Result<()> {
             Uuid::parse_str(&native)?;
             let path = Path::new(&raw);
-            let size = fs::metadata(path)?.len();
             file_fingerprint = fingerprint(path)?;
             let old = cache.get(&native).cloned().unwrap_or_else(|| json!({}));
             ensure!(
@@ -214,16 +288,28 @@ pub fn poll_limits(
                 "poll_cache_budget"
             );
             if old["file"] == file_fingerprint
-                && (!old["error_at"].as_f64().is_some_and(|t| t > 0.0)
+                && ((!old["error_at"].as_f64().is_some_and(|t| t > 0.0)
+                    && old["visible_history_version"] == VISIBLE_HISTORY_VERSION)
                     || now() - old["error_at"].as_f64().unwrap_or(0.0) < 300.0)
             {
                 return Ok(());
             }
-            if total + size.min(tail) > total_scan {
+            let mut source = match crate::rollout::Source::open(path, total_scan - total) {
+                Ok(source) => source,
+                Err(error) if total > 0 && error.to_string() == "rollout_source_limit" => {
+                    total = total_scan;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let size = source.len();
+            let scan_cost = source.scan_cost(tail);
+            if total + scan_cost > total_scan {
                 return Ok(());
             }
-            let (events, scanned) = completed_events(path, &native, &home, tail)?;
-            total += scanned;
+            // Charge decompression even when parsing or identity checks fail.
+            total += scan_cost;
+            let (events, _) = completed_source(path, &native, &home, tail, Some(&mut source))?;
             let mut confirmed = old["turn_id"].as_str().map(str::to_owned);
             if old["completed_at"].as_i64().unwrap_or(0) > 0 && confirmed.is_none() {
                 let db = Connection::open(database)?;
@@ -272,7 +358,45 @@ pub fn poll_limits(
                 confirmed = event["turn-id"].as_str().map(str::to_owned);
                 processed += 1;
             }
-            cache.insert(native.clone(),json!({"file":if processed==candidates.len(){file_fingerprint.clone()}else{Value::Null},"completed_at":latest,"turn_id":confirmed}));
+            // Keep the confirmed completion watermark even if history backfill
+            // fails or must wait for the next request's remaining scan budget.
+            cache.insert(
+                native.clone(),
+                json!({"file":Value::Null,"completed_at":latest,"turn_id":confirmed}),
+            );
+            if processed == candidates.len() {
+                ensure!(
+                    source.is_compressed() || size.min(tail).saturating_add(size) <= total_scan,
+                    "poll_scan_budget"
+                );
+                if source.is_compressed() {
+                    // Reuse the already bounded decoded history. Reading it again
+                    // from disk would starve histories larger than half the budget.
+                    source.seek(SeekFrom::Start(0))?;
+                    crate::visible_history::backfill_source(
+                        database,
+                        &index,
+                        &native,
+                        size as usize,
+                        Some(&mut source),
+                    )?;
+                    if fingerprint(path)? == file_fingerprint {
+                        cache.insert(native.clone(),json!({"file":file_fingerprint,"completed_at":latest,"turn_id":confirmed,"visible_history_version":VISIBLE_HISTORY_VERSION}));
+                    }
+                } else if total.saturating_add(size) <= total_scan {
+                    total += size;
+                    crate::visible_history::backfill_bounded(
+                        database,
+                        &index,
+                        &native,
+                        size as usize,
+                    )?;
+                    // A live append during the scan must be revisited next poll.
+                    if fingerprint(path)? == file_fingerprint {
+                        cache.insert(native.clone(),json!({"file":file_fingerprint,"completed_at":latest,"turn_id":confirmed,"visible_history_version":VISIBLE_HISTORY_VERSION}));
+                    }
+                }
+            }
             health::update(database, &native, "poll", None, None)?;
             Ok(())
         })();
@@ -296,6 +420,7 @@ pub fn poll_limits(
             }
         }
     }
+    crate::thread_titles::persist(database, &index, &titles)?;
     atomic_json(&cache_path, &json!(cache))
 }
 /// Pipe reads are bounded while a subprocess runs; timeout covers input and output.
@@ -379,6 +504,34 @@ pub async fn version(config: &RemoteConfig) -> Result<String> {
             .to_owned(),
     )
 }
+
+/// Only explicit, consistent remote project membership identifies the desktop owner.
+/// Missing/unreadable state is not evidence that previously known ownership vanished.
+fn desktop_remote_threads(home: &Path) -> Option<Value> {
+    let state = crate::desktop_projects::read_state(home)?;
+    let assignments = state["thread-project-assignments"].as_object()?;
+    if assignments.len() > 5000 {
+        return None;
+    }
+    let memberships = state["thread-project-membership-host-ids"].as_object()?;
+    let mut result = serde_json::Map::new();
+    for (native, project) in assignments {
+        if Uuid::parse_str(native).is_err() || project["projectKind"] != "remote" {
+            continue;
+        }
+        let Some(host) = project["hostId"].as_str() else {
+            continue;
+        };
+        if host.len() <= 256
+            && host.starts_with("remote-ssh-")
+            && memberships.get(native).and_then(Value::as_str) == Some(host)
+        {
+            result.insert(native.clone(), json!(host));
+        }
+    }
+    Some(Value::Object(result))
+}
+
 pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -> Result<Value> {
     if let Some(excluded) = request.get("excluded") {
         let ids = excluded.as_array().context("excluded_limit")?;
@@ -396,6 +549,7 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         }
     }
     initialize(database)?;
+    crate::message_images::initialize(&Connection::open(database)?)?;
     poll(config, database)?;
     let c = Connection::open(database)?;
     let mut identity = Vec::new();
@@ -407,11 +561,54 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         )?;
         identity.push(json!([counts.0, counts.1]));
     }
+    // Process-only changes must reach replicas without a new completed turn.
+    // Hash canonical rows: deletions/reinsertions can retain count/max(rowid).
+    let mut visible_digest = Sha256::new();
+    let mut statement = c.prepare("SELECT thread_id,turn_id,message_id,text,created_at FROM captured_visible_messages ORDER BY thread_id,message_id")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let record = (
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        );
+        visible_digest.update(serde_json::to_vec(&record)?);
+    }
+    identity.push(json!(format!("{:x}", visible_digest.finalize())));
+    let questions = c.prepare("SELECT thread_id,turn_id,message_id,text,created_at FROM captured_questions ORDER BY thread_id,message_id")?
+        .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(questions));
     let projects: Vec<(String, String)> = c
         .prepare("SELECT thread_id,project_path FROM captured_projects ORDER BY thread_id")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     identity.push(json!(projects));
+    let mut images_digest = Sha256::new();
+    let mut images = c.prepare("SELECT thread_id,message_id,source,image_id,mime,bytes FROM captured_assistant_images ORDER BY thread_id,message_id,source")?;
+    let mut rows = images.query([])?;
+    while let Some(row) = rows.next()? {
+        for col in 0..5 {
+            images_digest.update(serde_json::to_vec(&row.get::<_, String>(col)?)?);
+        }
+        let bytes: Vec<u8> = row.get(5)?;
+        images_digest.update((bytes.len() as u64).to_le_bytes());
+        images_digest.update(bytes);
+    }
+    identity.push(json!(format!("{:x}", images_digest.finalize())));
+    let tasks = c
+        .prepare("SELECT thread_id,turn_id,status FROM captured_task_state ORDER BY thread_id")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(tasks));
     let catalog = c
         .prepare("SELECT project_path FROM captured_project_catalog ORDER BY project_path")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -435,6 +632,11 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     identity.push(json!(titles));
+    let names = c
+        .prepare("SELECT thread_id,title FROM captured_thread_titles ORDER BY thread_id")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    identity.push(json!(names));
     let failures = health::read(database)?;
     identity.push(json!([failures["failures"], failures["overflow"]]));
     let revision = format!("{:x}", Sha256::digest(serde_json::to_vec(&identity)?));
@@ -446,6 +648,14 @@ pub async fn snapshot(config: &RemoteConfig, database: &Path, request: &Value) -
         .collect();
     let changed = request["revision"] != revision;
     let mut result = json!({"schema":1,"version":version(config).await?,"revision":revision,"capture_ok":blocked.is_empty()&&failures["overflow"]==false,"blocked_threads":blocked,"overflow":failures["overflow"],"changed":changed});
+    if let Some(origins) = desktop_remote_threads(&config.codex_home) {
+        result["desktop_remote_threads"] = origins;
+    }
+    if let Some(projects) = crate::desktop_projects::read_state(&config.codex_home)
+        .and_then(|state| crate::desktop_projects::from_state(&state))
+    {
+        result["desktop_projects"] = serde_json::to_value(projects)?;
+    }
     if changed {
         let tmp = database
             .parent()
@@ -509,6 +719,11 @@ where
             == expected,
         "queue_version_unverified"
     );
+    let question_reply = text.trim_start().starts_with(crate::questions::REPLY_START);
+    if question_reply {
+        poll(config, database)?;
+        crate::questions::validate_reply(&readonly(database)?, "captured_questions", native, text)?;
+    }
     let h = health::read(database)?;
     ensure!(
         h["overflow"] == false
@@ -519,17 +734,21 @@ where
                 .any(|v| v["thread_id"] == native),
         "target_capture_unconfirmed"
     );
-    let db = readonly(database)?;
-    ensure!(
-        db.query_row(
-            "SELECT 1 FROM captured_replies WHERE thread_id=? LIMIT 1",
-            [native],
-            |r| r.get::<_, i64>(0)
-        )
-        .optional()?
-        .is_some(),
-        "queue_target_not_captured"
-    );
+    // A validated pending question is an authoritative target even before the
+    // conversation's first completion. Ordinary messages keep the existing gate.
+    if !question_reply {
+        let db = readonly(database)?;
+        ensure!(
+            db.query_row(
+                "SELECT 1 FROM captured_replies WHERE thread_id=? LIMIT 1",
+                [native],
+                |r| r.get::<_, i64>(0)
+            )
+            .optional()?
+            .is_some(),
+            "queue_target_not_captured"
+        );
+    }
     // One invocation only. A lost acknowledgement is never retried here.
     let output = run(
         vec![
@@ -645,7 +864,7 @@ pub async fn handle(config: &RemoteConfig, database: &Path, request: &Value) -> 
 pub async fn run(args: RemoteArgs) -> Result<()> {
     let raw = bounded_stdin()?;
     let request: Value = serde_json::from_slice(&raw)?;
-    let config: RemoteConfig = serde_json::from_slice(&fs::read(&args.config)?)?;
+    let config = load_config(&args.config)?;
     let database = args
         .config
         .parent()
@@ -752,6 +971,293 @@ pub(crate) mod fixtures {
 mod tests {
     use super::*;
     use fixtures::Fixture;
+    #[test]
+    fn windows_upgrade_resolution_is_exact_and_never_grants_version_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("OpenAI/Codex/bin");
+        let configured = bin.join("0123456789abcdef/codex.exe");
+        let installed = bin.join("fedcba9876543210/codex.exe");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, b"fixture").unwrap();
+        assert_eq!(relocated_windows_codex(&configured).unwrap(), installed);
+        assert!(
+            relocated_windows_codex(&temp.path().join("other/bin/0123456789abcdef/codex.exe"))
+                .is_err()
+        );
+        fs::create_dir_all(configured.parent().unwrap()).unwrap();
+        fs::write(&configured, b"fixture").unwrap();
+        assert!(relocated_windows_codex(&configured).is_err());
+    }
+    #[test]
+    fn compression_migration_keeps_watermark_and_recovers_both_sides() {
+        let mut f = Fixture::new();
+        let first = f.append("first human");
+        f.capture();
+        let second = f.append("second human");
+        append_process(&f, &second, "process", "visible process");
+        let compressed = crate::collection::suffix(&f.path, ".zst");
+        let bytes = fs::read(&f.path).unwrap();
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&f.path).unwrap();
+        health::update(
+            &f.db,
+            &f.native,
+            "poll",
+            Some("capture_not_confirmed"),
+            None,
+        )
+        .unwrap();
+        f.capture();
+        f.capture();
+        assert_eq!(f.count(), 2);
+        assert!(health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            crate::native_input::read_turn(&f.index, &f.native, &first)
+                .unwrap()
+                .0[0]
+                .text,
+            "first human"
+        );
+        let db = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_user_messages", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT text FROM captured_visible_messages WHERE message_id='process'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "visible process"
+        );
+        let cache: Value =
+            serde_json::from_slice(&fs::read(f.db.parent().unwrap().join("poll.json")).unwrap())
+                .unwrap();
+        assert_eq!(cache[&f.native]["turn_id"], second);
+        assert_eq!(
+            fs::read(&compressed).unwrap(),
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap()
+        );
+        assert!(!f.path.exists());
+    }
+    #[test]
+    fn compressed_history_obeys_decoded_budget_and_identity() {
+        let mut f = Fixture::new();
+        f.append("human");
+        let bytes = fs::read(&f.path).unwrap();
+        let compressed = crate::collection::suffix(&f.path, ".zst");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&f.path).unwrap();
+        poll_limits(&f.config, &f.db, 100, bytes.len() as u64 - 1).unwrap();
+        assert_eq!(f.count(), 0);
+        assert!(!health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert!(
+            completed_events(&f.path, &Uuid::new_v4().to_string(), &f.home, TAIL_BYTES).is_err()
+        );
+        let outside = f._temp.path().join("outside.jsonl.zst");
+        fs::copy(&compressed, &outside).unwrap();
+        assert!(completed_events(&outside, &f.native, &f.home, TAIL_BYTES).is_err());
+    }
+    #[test]
+    fn compressed_backfill_reuses_decoded_bytes_without_starving_next_history() {
+        let mut f = Fixture::new();
+        let turn = f.append("human");
+        f.capture();
+        append_process(&f, &turn, "process", "visible process");
+        let bytes = fs::read(&f.path).unwrap();
+        fs::write(
+            crate::collection::suffix(&f.path, ".zst"),
+            zstd::stream::encode_all(bytes.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&f.path).unwrap();
+        poll_limits(&f.config, &f.db, bytes.len() as u64, bytes.len() as u64 + 1).unwrap();
+        let cache: Value =
+            serde_json::from_slice(&fs::read(f.db.parent().unwrap().join("poll.json")).unwrap())
+                .unwrap();
+        assert_eq!(cache[&f.native]["file"], fingerprint(&f.path).unwrap());
+        let db = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_visible_messages", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert!(health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
+    fn append_process(f: &Fixture, turn: &str, id: &str, text: &str) {
+        let record = json!({"type":"response_item","timestamp":"2023-11-14T22:13:25Z","payload":{"type":"message","role":"assistant","id":id,"phase":"commentary","content":[{"type":"output_text","text":text}],"internal_chat_message_metadata_passthrough":{"turn_id":turn}}});
+        let mut file = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
+        writeln!(file, "{record}").unwrap();
+    }
+    #[test]
+    fn old_poll_cache_backfills_process_without_a_new_completion() {
+        let mut f = Fixture::new();
+        let turn = f.append("human");
+        append_process(&f, &turn, "process", "visible process");
+        f.capture();
+        let db = Connection::open(&f.db).unwrap();
+        db.execute("DELETE FROM captured_visible_messages", [])
+            .unwrap();
+        let cache_path = f.db.parent().unwrap().join("poll.json");
+        let mut cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        cache[&f.native]
+            .as_object_mut()
+            .unwrap()
+            .remove("visible_history_version");
+        atomic_json(&cache_path, &cache).unwrap();
+        let before = fingerprint(&f.path).unwrap();
+        f.capture();
+        f.capture();
+        assert_eq!(fingerprint(&f.path).unwrap(), before);
+        assert_eq!(f.count(), 1);
+        assert_eq!(
+            db.query_row("SELECT text FROM captured_visible_messages", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "visible process"
+        );
+        let cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(cache[&f.native]["turn_id"], turn);
+        assert_eq!(
+            cache[&f.native]["visible_history_version"],
+            VISIBLE_HISTORY_VERSION
+        );
+    }
+    #[test]
+    fn process_backfill_obeys_scan_budget_and_preserves_completion_watermark() {
+        let mut f = Fixture::new();
+        let turn = f.append("human");
+        f.capture();
+        append_process(&f, &turn, "process", "visible process");
+        let size = fs::metadata(&f.path).unwrap().len();
+        poll_limits(&f.config, &f.db, size, size + 100).unwrap();
+        assert!(!health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        let cache: Value =
+            serde_json::from_slice(&fs::read(f.db.parent().unwrap().join("poll.json")).unwrap())
+                .unwrap();
+        assert_eq!(cache[&f.native]["turn_id"], turn);
+        assert!(
+            Connection::open(&f.db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM captured_visible_messages", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 0
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_tracks_live_process_and_same_count_content_changes() {
+        let mut f = Fixture::new();
+        f.append("human");
+        f.config.codex = "/bin/echo".into();
+        let first = snapshot(&f.config, &f.db, &json!({})).await.unwrap();
+        append_process(&f, &Uuid::new_v4().to_string(), "live", "live process");
+        let live = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(live["changed"], true);
+        assert_eq!(f.count(), 1);
+        // Capture rows are immutable, but a replica reset can reuse rowids.
+        let db = Connection::open(&f.db).unwrap();
+        db.execute(
+            "UPDATE captured_visible_messages SET text='replaced process'",
+            [],
+        )
+        .unwrap();
+        let replaced = snapshot(&f.config, &f.db, &json!({"revision":live["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(replaced["changed"], true);
+        assert_eq!(
+            snapshot(&f.config, &f.db, &json!({"revision":replaced["revision"]}))
+                .await
+                .unwrap()["changed"],
+            false
+        );
+    }
+    #[test]
+    fn multi_image_record_preserves_capture_and_later_turns() {
+        let mut f = Fixture::new();
+        f.append("first message");
+        f.capture();
+        let turn = Uuid::new_v4().to_string();
+        let mut content = vec![json!({"type":"input_text","text":"six photos"})];
+        let mut kinds = vec!["user.text"];
+        for byte in 0..6 {
+            let encoded = STANDARD.encode(vec![byte; 2304 * 1024]);
+            content.push(json!({"type":"input_image","image_url":format!("data:image/jpeg;base64,{encoded}")}));
+            kinds.push("user.image");
+        }
+        let user = json!({"type":"response_item","payload":{"type":"message","role":"user","id":"six-photos","content":content,"internal_chat_message_metadata_passthrough":{"turn_id":turn,"create_time":1700000004,"content_item_kinds":kinds}}});
+        let line = user.to_string();
+        assert!(line.len() > 16 * 1024 * 1024);
+        let completed = json!({"type":"event_msg","timestamp":"2023-11-14T22:13:24Z","payload":{"type":"task_complete","turn_id":turn,"last_agent_message":"photo reply"}});
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
+            writeln!(file, "{line}\n{completed}").unwrap();
+        }
+        // Recover from a failed poll using the already confirmed first turn.
+        health::update(
+            &f.db,
+            &f.native,
+            "poll",
+            Some("capture_not_confirmed"),
+            None,
+        )
+        .unwrap();
+        f.append("after the photos");
+        f.capture();
+        f.capture();
+        crate::visible_history::backfill(&f.db, &f.index, &f.native).unwrap();
+        assert_eq!(f.count(), 3);
+        let db = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_user_messages", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_images", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert!(health::read(&f.db).unwrap()["failures"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+    }
     #[test]
     fn latest_seed_new_turns_preserve_human_order_and_ids() {
         let mut f = Fixture::new();
@@ -914,6 +1420,111 @@ mod tests {
             .read_to_end(&mut db)
             .unwrap();
         assert!(db.starts_with(b"SQLite format 3"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_project_changes_are_sent_even_without_body_changes() {
+        let mut f = Fixture::new();
+        f.append("human");
+        f.config.codex = "/bin/echo".into();
+        let first = snapshot(&f.config, &f.db, &json!({})).await.unwrap();
+        let alias = "remote-ssh-discovered:server";
+        let mut state = json!({
+            "remote-projects":[{"id":"new-project","hostId":alias,"remotePath":"/code/screen_control","label":"控屏"}],
+            "thread-project-assignments":{&f.native:{"projectKind":"remote","hostId":alias,"projectId":"new-project"}},
+            "thread-project-membership-host-ids":{&f.native:alias}
+        });
+        let path = f.home.join(".codex-global-state.json");
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let result = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["changed"], false);
+        assert!(result.get("database").is_none());
+        assert_eq!(result["desktop_projects"]["projects"][0]["name"], "控屏");
+        assert_eq!(
+            result["desktop_projects"]["assignments"][0]["native"],
+            f.native
+        );
+        state["remote-projects"][0]["label"] = json!("改名后");
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let result = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["changed"], false);
+        assert_eq!(result["desktop_projects"]["projects"][0]["name"], "改名后");
+        fs::write(path, b"{broken").unwrap();
+        let result = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert!(result.get("desktop_projects").is_none());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn question_only_snapshot_and_state_changes_reach_remote_replicas() {
+        let mut f = Fixture::new();
+        f.config.codex = "/bin/echo".into();
+        let turn = Uuid::new_v4().to_string();
+        let question = json!({"type":"response_item","timestamp":"2026-10-19T01:00:00Z","payload":{"type":"function_call","name":"request_user_input_async","call_id":"call_remote_question","arguments":json!({"questions":[{"title":"选择网络"}]}).to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":turn}}});
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&f.path).unwrap(),
+            "{question}"
+        )
+        .unwrap();
+        let first = snapshot(&f.config, &f.db, &json!({})).await.unwrap();
+        let db = Connection::open(&f.db).unwrap();
+        let (count, body): (i64, String) = db
+            .query_row("SELECT count(*),text FROM captured_questions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let q: crate::questions::Question = serde_json::from_str(&body).unwrap();
+        assert_eq!(q.status, "pending");
+        assert_eq!(
+            db.query_row(
+                "SELECT title FROM captured_thread_titles WHERE thread_id=?1",
+                [&f.native],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "测试对话"
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_replies", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+                .await
+                .unwrap()["changed"],
+            false
+        );
+        // State alone changes the snapshot, without a new question/message row.
+        db.execute("UPDATE captured_questions SET text=json_set(text,'$.status','answered','$.answer','公网')",[]).unwrap();
+        let answered = snapshot(&f.config, &f.db, &json!({"revision":first["revision"]}))
+            .await
+            .unwrap();
+        assert_eq!(answered["changed"], true);
+        assert_eq!(
+            snapshot(&f.config, &f.db, &json!({"revision":answered["revision"]}))
+                .await
+                .unwrap()["changed"],
+            false
+        );
+        // Replica purge includes questions while preserving the native record.
+        crate::collection::write_policy(&f.db, &json!({"schema":1,"enabled":true,"generation":Uuid::new_v4().to_string(),"cutoff_ms":1,"excluded":[]})).unwrap();
+        crate::collection::purge(&f.db, std::slice::from_ref(&f.native)).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_questions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(f.path.exists());
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -1192,6 +1803,58 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn pending_question_can_be_answered_before_first_completion() {
+        let mut f = Fixture::new();
+        f.config.verified_version = Some("fixture".into());
+        let turn = Uuid::new_v4().to_string();
+        let call = json!({"type":"response_item","timestamp":"2026-10-19T01:00:00Z","payload":{"type":"function_call","name":"request_user_input_async","call_id":"call_queued_question","arguments":json!({"questions":[{"title":"选择网络"}]}).to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":turn}}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&f.path).unwrap(),
+            "{call}"
+        )
+        .unwrap();
+        let id = json!(["request_user_input_async", "call_queued_question", 0]).to_string();
+        let text = format!(
+            "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>\n",
+            json!([{"questionItemId":id,"question":"选择网络","answer":"公网"}])
+        );
+        let request = json!({"thread":f.native,"text":text,"expected_version":"fixture"});
+        let mut calls = Vec::new();
+        dispatch_with_runner(&f.config, &f.db, &request, |args, _, _| {
+            calls.push(args.clone());
+            std::future::ready(Ok(if args == ["--version"] {
+                "fixture\n".into()
+            } else {
+                "queued fixture".into()
+            }))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1],
+            vec![
+                "queue".to_owned(),
+                "--thread".into(),
+                f.native.clone(),
+                format!("--message={text}")
+            ]
+        );
+        let db = Connection::open(&f.db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_replies", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM captured_questions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[tokio::test]
     async fn lost_queue_acknowledgement_is_never_retried() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1222,5 +1885,35 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod desktop_origin_tests {
+    use super::*;
+    #[test]
+    fn desktop_ownership_requires_consistent_explicit_remote_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(desktop_remote_threads(dir.path()).is_none());
+        let native = Uuid::new_v4().to_string();
+        let local = Uuid::new_v4().to_string();
+        let stale = Uuid::new_v4().to_string();
+        let alias = "remote-ssh-discovered:server";
+        let state = json!({"thread-project-assignments":{
+            &native:{"projectKind":"remote","hostId":alias},
+            &stale:{"projectKind":"remote","hostId":alias},
+            &local:{"projectKind":"local","hostId":"local"}
+        },"thread-project-membership-host-ids":{&native:alias,&stale:"local",&local:"local"}});
+        fs::write(
+            dir.path().join(".codex-global-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            desktop_remote_threads(dir.path()).unwrap(),
+            json!({native:alias})
+        );
+        fs::write(dir.path().join(".codex-global-state.json"), b"{broken").unwrap();
+        assert!(desktop_remote_threads(dir.path()).is_none());
     }
 }

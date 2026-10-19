@@ -4,7 +4,7 @@ import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName="threads")
-data class ThreadRow(@PrimaryKey val id:String, val title:String, val hostId:String, val status:String, val revision:String, val updated:Long, val canSend:Boolean, val online:Boolean, val historyCursor:String?, @ColumnInfo(defaultValue="0") val messageRevision:Long=0, @ColumnInfo(defaultValue="0") val messageActivityAt:Long=0, @ColumnInfo(defaultValue="''") val project:String="", @ColumnInfo(defaultValue="0") val localOnly:Boolean=false, @ColumnInfo(defaultValue="''") val projectName:String="", @ColumnInfo(defaultValue="0") val projectKnown:Boolean=false)
+data class ThreadRow(@PrimaryKey val id:String, val title:String, val hostId:String, val status:String, val revision:String, val updated:Long, val canSend:Boolean, val online:Boolean, val historyCursor:String?, @ColumnInfo(defaultValue="0") val messageRevision:Long=0, @ColumnInfo(defaultValue="0") val messageActivityAt:Long=0, @ColumnInfo(defaultValue="''") val project:String="", @ColumnInfo(defaultValue="0") val localOnly:Boolean=false, @ColumnInfo(defaultValue="''") val projectName:String="", @ColumnInfo(defaultValue="0") val projectKnown:Boolean=false, @ColumnInfo(defaultValue="'unknown'") val taskStatus:String="unknown", @ColumnInfo(defaultValue="''") val taskTurnId:String="", @ColumnInfo(defaultValue="''") val displayHostId:String="")
 @Entity(tableName="messages", primaryKeys=["threadId","id"], indices=[Index(value=["threadId","ordinal"])])
 data class MessageRow(val threadId:String,val id:String,val turnId:String,val role:String,val text:String,val version:String,val ordinal:Long,val characters:Int, @ColumnInfo(defaultValue="0") val timestamp:Long=0)
 @Entity(tableName="drafts") data class Draft(@PrimaryKey val threadId:String,val text:String)
@@ -20,6 +20,7 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Query("DELETE FROM projects") suspend fun clearProjects()
  @Query("SELECT * FROM hosts ORDER BY CASE lower(name) WHEN 'echova' THEN 0 WHEN 'lerrem' THEN 1 WHEN 'nix' THEN 2 ELSE 3 END,name") fun hosts():Flow<List<HostRow>>
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putHosts(rows:List<HostRow>)
+ @Query("SELECT * FROM hosts") suspend fun allHosts():List<HostRow>
  @Query("DELETE FROM hosts") suspend fun clearHosts()
  @Query("SELECT generation FROM sync WHERE id=1") suspend fun generation():String?
  @Query("DELETE FROM drafts") suspend fun clearDrafts()
@@ -38,6 +39,8 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Query("DELETE FROM messages") suspend fun clearMessages()
  @Query("SELECT * FROM threads ORDER BY MAX(updated*1000,messageActivityAt) DESC,id") fun threads():Flow<List<ThreadRow>>
  @Query("SELECT * FROM threads WHERE id=:id") suspend fun thread(id:String):ThreadRow?
+ @Query("SELECT * FROM threads WHERE id=:id") fun threadFlow(id:String):Flow<ThreadRow?>
+ @Query("SELECT * FROM messages WHERE threadId=:thread AND id=:id") suspend fun message(thread:String,id:String):MessageRow?
  @Query("SELECT * FROM messages WHERE threadId=:id AND (ordinal<:before OR (ordinal=:before AND id<:beforeId)) ORDER BY ordinal DESC,id DESC LIMIT :limit") fun messages(id:String,before:Long,beforeId:String,limit:Int=100):Flow<List<MessageRow>>
  @Query("SELECT * FROM drafts WHERE threadId=:id") suspend fun draft(id:String):Draft?
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putThreads(rows:List<ThreadRow>)
@@ -59,5 +62,5 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Query("DELETE FROM messages WHERE rowid IN (SELECT rowid FROM messages ORDER BY rowid ASC LIMIT 100)") suspend fun evictMessages()
  @Query("DELETE FROM messages WHERE rowid IN (SELECT rowid FROM messages ORDER BY rowid ASC LIMIT MAX(0,(SELECT count(*) FROM messages)-5000))") suspend fun prune()
 }
-@Database(entities=[ThreadRow::class,MessageRow::class,Draft::class,Pending::class,SyncState::class,ChunkRow::class,HostRow::class,ProjectRow::class],version=6,exportSchema=true)
+@Database(entities=[ThreadRow::class,MessageRow::class,Draft::class,Pending::class,SyncState::class,ChunkRow::class,HostRow::class,ProjectRow::class],version=9,exportSchema=true)
 abstract class BridgeDatabase:RoomDatabase(){abstract fun dao():BridgeDao}

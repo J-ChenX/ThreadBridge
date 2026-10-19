@@ -1,7 +1,7 @@
 //! Bounded local import of allowlisted notify replies into the existing Hub projection.
 use crate::{model::*, store::Store};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 
 pub fn import(db: &Store, source: &Path, host: &str, native: &str) -> Result<usize> {
@@ -57,7 +57,37 @@ fn import_title(
         [native],
         |r| r.get(0),
     )?;
-    if count == 0 {
+    let has_tasks: bool = source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE name='captured_task_state'",
+        [],
+        |r| r.get(0),
+    )?;
+    let task: Option<(String, String)> = if has_tasks {
+        source
+            .query_row(
+                "SELECT turn_id,status FROM captured_task_state WHERE thread_id=?1",
+                [native],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    let has_questions: bool = source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE name='captured_questions'",
+        [],
+        |r| r.get(0),
+    )?;
+    let question_count: i64 = if has_questions {
+        source.query_row(
+            "SELECT count(*) FROM captured_questions WHERE thread_id=?1",
+            [native],
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    if count == 0 && task.is_none() && question_count == 0 {
         return Ok(0);
     }
     let last_row: i64 = db.0.lock().unwrap().query_row(
@@ -75,8 +105,10 @@ fn import_title(
     } else {
         "SELECT turn_id,captured_at FROM captured_replies WHERE thread_id=?1 ORDER BY rowid DESC LIMIT 1"
     };
-    let (latest_turn, updated): (String, i64) =
-        source.query_row(latest_sql, [native], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let (latest_turn, updated): (String, i64) = source
+        .query_row(latest_sql, [native], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .unwrap_or((String::new(), 0));
     let has_title: bool = {
         let mut q = source.prepare("PRAGMA table_info(captured_replies)")?;
         let names = q
@@ -87,7 +119,25 @@ fn import_title(
     let fallback = registered_title
         .map(str::to_owned)
         .unwrap_or_else(|| format!("会话 · {}", &native[..8]));
-    let title = if has_title {
+    let has_thread_titles: bool = source.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_thread_titles'",
+        [],
+        |r| r.get(0),
+    )?;
+    let native_title: Option<String> = if has_thread_titles {
+        source
+            .query_row(
+                "SELECT title FROM captured_thread_titles WHERE thread_id=?1",
+                [native],
+                |r| r.get(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
+    let title = if let Some(value) = native_title.filter(|title| !title.trim().is_empty()) {
+        value
+    } else if has_title && count > 0 {
         let value: String = source.query_row(
             "SELECT title FROM captured_replies WHERE thread_id=?1 ORDER BY rowid DESC LIMIT 1",
             [native],
@@ -197,6 +247,8 @@ fn import_title(
         } else {
             captured.saturating_mul(1000)
         };
+        let text =
+            crate::message_images::render(&source, native, &format!("notify:{turn}"), &text)?;
         db.capture_snapshot(
             host,
             &Snapshot {
@@ -308,6 +360,8 @@ fn import_title(
             ))
         })? {
             let (turn, text, ordinal) = row?;
+            let text =
+                crate::message_images::render(&source, native, &format!("notify:{turn}"), &text)?;
             db.capture_snapshot(
                 host,
                 &Snapshot {
@@ -342,6 +396,7 @@ fn import_title(
                 !text.is_empty() && text.len() <= 256 * 1024 && id.len() <= 128,
                 "invalid_capture_user_input"
             );
+            let text = crate::questions::visible_reply(&text);
             db.capture_snapshot(
                 host,
                 &Snapshot {
@@ -369,9 +424,69 @@ fn import_title(
             let (row,turn,id,text,ordinal)=row?;
             uuid::Uuid::parse_str(&turn)?;
             anyhow::ensure!(!text.is_empty() && text.len()<=256*1024 && id.len()<=128,"invalid_visible_message");
+            let text=crate::message_images::render(&source,native,&format!("native:{id}"),&text)?;
             db.capture_snapshot(host,&Snapshot {thread:projection.clone(),messages:vec![ChatMessage{id:format!("native:{id}"),turn_id:turn,role:"assistant".into(),version:hash(&text),text,ordinal}],initial:true,history:false},&title)?;
             db.0.lock().unwrap().execute("INSERT INTO capture_visible_import_positions VALUES(?1,?2) ON CONFLICT(thread) DO UPDATE SET last_row=excluded.last_row",rusqlite::params![projection.id,row])?;
         }
+    }
+    if has_questions {
+        let mut q = source.prepare("SELECT turn_id,message_id,text,created_at FROM captured_questions WHERE thread_id=?1 ORDER BY created_at,message_id")?;
+        for row in q.query_map([native], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (turn, id, text, ordinal) = row?;
+            uuid::Uuid::parse_str(&turn)?;
+            let question: crate::questions::Question = serde_json::from_str(&text)?;
+            question.validate()?;
+            anyhow::ensure!(id == question.message_id(), "invalid_question_identity");
+            let version = hash(&text);
+            let unchanged: bool = db.0.lock().unwrap().query_row(
+                "SELECT count(*)>0 FROM messages WHERE thread=?1 AND id=?2 AND version=?3 AND ordinal=?4",
+                rusqlite::params![projection.id,id,version,ordinal], |r|r.get(0),
+            )?;
+            if unchanged {
+                continue;
+            }
+            db.capture_snapshot(
+                host,
+                &Snapshot {
+                    thread: projection.clone(),
+                    messages: vec![ChatMessage {
+                        id,
+                        turn_id: turn,
+                        role: "question".into(),
+                        version,
+                        text,
+                        ordinal,
+                    }],
+                    initial: true,
+                    history: false,
+                },
+                &title,
+            )?;
+        }
+    }
+    if let Some((turn, status)) = task {
+        uuid::Uuid::parse_str(&turn)?;
+        anyhow::ensure!(
+            ["running", "completed", "failed", "interrupted"].contains(&status.as_str()),
+            "invalid_task_status"
+        );
+        let mut c = db.0.lock().unwrap();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute("INSERT INTO thread_tasks VALUES(?1,?2,?3) ON CONFLICT(thread) DO UPDATE SET turn_id=excluded.turn_id,status=excluded.status WHERE turn_id<>excluded.turn_id OR status<>excluded.status", rusqlite::params![projection.id,turn,status])?;
+        if changed > 0 {
+            tx.execute(
+                "INSERT INTO events(kind,thread,created) VALUES('task_state',?1,?2)",
+                rusqlite::params![projection.id, now()],
+            )?;
+        }
+        tx.commit()?;
     }
     if source.query_row(
         "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name='captured_images'",
@@ -409,13 +524,14 @@ fn import_title(
             );
             anyhow::ensure!(
                 image == hash_bytes(&bytes)
-                    && bytes.len() <= 2 * 1024 * 1024
+                    && bytes.len() <= crate::native_input::MAX_IMAGE_BYTES
                     && ["image/png", "image/jpeg", "image/webp"].contains(&mime.as_str()),
                 "invalid_image"
             );
             c.execute("INSERT OR IGNORE INTO attachments SELECT ?1,?2,?3,?4,?5 WHERE EXISTS(SELECT 1 FROM messages WHERE thread=?1 AND id=?2) AND NOT EXISTS(SELECT 1 FROM tombstones WHERE thread=?1 AND (message='' OR message=?2))",rusqlite::params![projection.id,format!("input:{message}"),image,mime,bytes])?;
         }
     }
+    crate::message_images::import(db, &source, host, &projection, &title)?;
     Ok(imported)
 }
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -545,7 +661,7 @@ pub async fn sync_catalog(
         let selected = if all_captured {
             let read = || -> Result<std::collections::BTreeMap<String, String>> {
                 let c = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-                let mut q = c.prepare("SELECT DISTINCT thread_id FROM captured_replies")?;
+                let mut q = c.prepare(&captured_ids_sql(&c)?)?;
                 let natives = q
                     .query_map([], |r| r.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -560,7 +676,7 @@ pub async fn sync_catalog(
                     save_health(
                         &db,
                         &host,
-                        serde_json::json!({"failures":[],"overflow":false,"projection_error":"capture_source_unavailable"}),
+                        serde_json::json!({"failures":{},"overflow":false,"projection_error":"capture_source_unavailable"}),
                     )?;
                     eprintln!("Completion projection unavailable; retrying without sending");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -590,11 +706,18 @@ pub async fn sync_catalog(
             if let Some(index) = &native_index {
                 let refresh = (|| -> Result<()> {
                     let c = crate::collection::readonly(index)?;
-                    let path: String = c.query_row(
-                        "SELECT rollout_path FROM threads WHERE id=?1",
-                        [native],
-                        |r| r.get(0),
-                    )?;
+                    // Captured history can outlive its entry in the current native index.
+                    // Keep importing the saved replica; there is no live source to refresh.
+                    let path: Option<String> = c
+                        .query_row(
+                            "SELECT rollout_path FROM threads WHERE id=?1",
+                            [native],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(path) = path else {
+                        return Ok(());
+                    };
                     let fingerprint = crate::native_remote::fingerprint(Path::new(&path))?;
                     if fingerprints.get(native) != Some(&fingerprint) {
                         crate::visible_history::backfill(&source, index, native)?;
@@ -668,6 +791,28 @@ fn read_health(source: &Path) -> Result<serde_json::Value> {
         .ok_or_else(|| anyhow::anyhow!("invalid_capture_status"))
 }
 
+fn captured_ids_sql(c: &Connection) -> Result<String> {
+    let tasks: bool = c.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE name='captured_task_state'",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut sql = if tasks {
+        "SELECT thread_id FROM captured_replies UNION SELECT thread_id FROM captured_task_state"
+            .to_owned()
+    } else {
+        "SELECT DISTINCT thread_id FROM captured_replies".to_owned()
+    };
+    if c.query_row(
+        "SELECT count(*)>0 FROM sqlite_master WHERE name='captured_questions'",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        sql.push_str(" UNION SELECT thread_id FROM captured_questions");
+    }
+    Ok(sql)
+}
+
 /// Discover only conversations already present in the configured capture database.
 fn bridge_threads(source: &Path, native: Option<&str>) -> Result<Vec<String>> {
     if let Some(native) = native {
@@ -676,7 +821,7 @@ fn bridge_threads(source: &Path, native: Option<&str>) -> Result<Vec<String>> {
     }
     let c = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     c.busy_timeout(std::time::Duration::from_secs(3))?;
-    let mut q = c.prepare("SELECT DISTINCT thread_id FROM captured_replies ORDER BY thread_id")?;
+    let mut q = c.prepare(&format!("{} ORDER BY thread_id", captured_ids_sql(&c)?))?;
     let ids = q
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;

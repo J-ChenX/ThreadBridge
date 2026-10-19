@@ -130,6 +130,7 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
         "queue_version_unverified"
     );
     let mut db = rusqlite::Connection::open(database)?;
+    db.busy_timeout(Duration::from_secs(3))?;
     db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS phone_creations(request TEXT PRIMARY KEY,digest TEXT NOT NULL,native TEXT,status TEXT NOT NULL)")?;
     let digest = hash(&serde_json::to_string(request)?);
     if let Some((old, native, status)) = db
@@ -170,9 +171,20 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
     }
     let health = crate::health::read(database)?;
     ensure!(health["overflow"] == false, "capture_unavailable");
-    let mut adapter =
-        Adapter::connect_with_home(&config.codex, None, Some(version), Some(&config.codex_home))
-            .await?;
+    let mut adapter = match Adapter::connect_for_creation(
+        &config.codex,
+        version,
+        &config.codex_home,
+    )
+    .await
+    {
+        Ok(adapter) => adapter,
+        Err(_) => {
+            return Ok(
+                json!({"native_id":null,"status":"rejected","error":"creation_executor_unavailable"}),
+            )
+        }
+    };
     db.execute(
         "INSERT INTO phone_creations VALUES(?1,?2,NULL,'intent')",
         params![id, digest],
@@ -195,18 +207,37 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
         "UPDATE phone_creations SET native=?2 WHERE request=?1",
         params![id, native],
     )?;
-    let output = native_remote::codex_output(
-        config,
-        &[
-            "queue".into(),
-            "--thread".into(),
-            native.into(),
-            format!("--message={text}"),
-        ],
-        Duration::from_secs(10),
-        4096,
-    )
-    .await;
+    // thread/start defers its rollout until a durable mutation. Queue reads
+    // the thread store from another process and cannot see an in-memory blank.
+    // Naming this new thread persists it without starting a model turn.
+    let title: String = text
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect();
+    let named = adapter
+        .rpc("thread/name/set", json!({"threadId":native,"name":title}))
+        .await
+        .is_ok();
+    let output = if named {
+        native_remote::codex_output(
+            config,
+            &[
+                "queue".into(),
+                "--thread".into(),
+                native.into(),
+                format!("--message={text}"),
+            ],
+            Duration::from_secs(10),
+            4096,
+        )
+        .await
+    } else {
+        Err(anyhow::anyhow!("creation_persistence_unconfirmed"))
+    };
     // Once native identity is durable, an uncertain queue must still project it to the phone.
     let queued = output
         .as_deref()
@@ -265,6 +296,20 @@ pub async fn dispatch(
         )
         .await?
     };
+    if result["status"] == "rejected" && result["native_id"].is_null() {
+        db.0.lock().unwrap().execute(
+            "UPDATE capture_queue_ledger SET status='rejected' WHERE id=?1",
+            [&cmd.id],
+        )?;
+        db.receipt(
+            host,
+            &cmd.id,
+            "rejected",
+            None,
+            Some("creation_executor_unavailable"),
+        )?;
+        return Ok(());
+    }
     let native = result["native_id"]
         .as_str()
         .context("creation_unconfirmed")?;
@@ -371,7 +416,7 @@ mod tests {
         assert_eq!(create(&config, &database, &request).await.unwrap(), result);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "start\nqueue\n"
+            "start\nname\nqueue\n"
         );
         let mut changed = request.clone();
         changed["text"] = json!("different");
@@ -381,6 +426,68 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "idempotency_conflict"
+        );
+    }
+    #[tokio::test]
+    async fn missing_desktop_socket_uses_standalone_before_creation_once() {
+        let (dir, config, database, request) = fixture(true, false);
+        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"no_socket":true});
+        std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
+        let result = create(&config, &database, &request).await.unwrap();
+        assert_eq!(result["native_id"], NATIVE);
+        assert_eq!(result["status"], "upstream_queued");
+        assert_eq!(create(&config, &database, &request).await.unwrap(), result);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "start\nname\nqueue\n"
+        );
+    }
+    #[tokio::test]
+    async fn unavailable_executor_rejects_before_any_creation_intent() {
+        let (dir, config, database, request) = fixture(true, false);
+        let settings =
+            json!({"mode":"create","native_id":NATIVE,"no_socket":true,"fail_initialize":true});
+        std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
+        let result = create(&config, &database, &request).await.unwrap();
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["error"], "creation_executor_unavailable");
+        assert!(!dir.path().join("calls").exists());
+        assert_eq!(
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .query_row("SELECT count(*) FROM phone_creations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn lost_persistence_ack_preserves_identity_and_never_queues() {
+        let (dir, config, database, request) = fixture(true, false);
+        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"lose_name":true});
+        std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
+        let result = create(&config, &database, &request).await.unwrap();
+        assert_eq!(result["native_id"], NATIVE);
+        assert_eq!(result["status"], "unknown");
+        assert_eq!(create(&config, &database, &request).await.unwrap(), result);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "start\nname\n"
+        );
+    }
+    #[tokio::test]
+    async fn missing_socket_and_lost_start_ack_never_create_again() {
+        let (dir, config, database, request) = fixture(true, true);
+        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"no_socket":true,"lose_start":true});
+        std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
+        assert!(create(&config, &database, &request).await.is_err());
+        assert_eq!(
+            create(&config, &database, &request).await.unwrap()["status"],
+            "unknown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "start\n"
         );
     }
     #[tokio::test]
@@ -402,7 +509,7 @@ mod tests {
                 if lose_start {
                     "start\n"
                 } else {
-                    "start\nqueue\n"
+                    "start\nname\nqueue\n"
                 }
             );
         }
@@ -425,7 +532,7 @@ mod tests {
         assert_eq!(create(&config, &database, &request).await.unwrap(), result);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "start\nqueue\n"
+            "start\nname\nqueue\n"
         );
     }
     #[tokio::test]

@@ -19,7 +19,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.window.DialogWindowProvider
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.core.view.WindowCompat
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -30,52 +34,71 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.os.Build
+import android.widget.Toast
 
 @Composable internal fun ConversationImageViewer(repo:Repository,message:MessageRow,id:String,thumbnail:Bitmap,close:()->Unit) {
  var bitmap by remember(id){mutableStateOf(thumbnail)}
- var loading by remember(id){mutableStateOf(true)}
+
  var failed by remember(id){mutableStateOf(false)}
  var attempt by remember(id){mutableIntStateOf(0)}
- LaunchedEffect(id,attempt){loading=true;failed=false;try{bitmap=repo.userImage(message,id,1600)}catch(e:CancellationException){throw e}catch(_:Exception){failed=true}finally{loading=false}}
+ LaunchedEffect(id,attempt){failed=false;try{bitmap=repo.userImage(message,id,1600)}catch(e:CancellationException){throw e}catch(_:Exception){failed=true}}
  var transform by remember(id){mutableStateOf(ImageTransform())}
  var viewport by remember{mutableStateOf(IntSize.Zero)}
- val density=LocalDensity.current
- var footerHeight by remember{mutableStateOf(88.dp)}
+ val context=LocalContext.current
+ var backdrop by remember{mutableStateOf<Bitmap?>(null)}
+ LaunchedEffect(Unit){backdrop=imageBackdrop(context)}
+ var downloading by remember{mutableStateOf(false)}
+ var export by remember{mutableStateOf<OriginalImage?>(null)}
  val scope=rememberCoroutineScope();var motion by remember{mutableStateOf<Job?>(null)}
  fun constrain(value:ImageTransform)=constrainImage(value,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat())
  fun animate(target:ImageTransform){
   motion?.cancel();val start=transform
   motion=scope.launch{Animatable(0f).animateTo(1f,tween(BridgeMotion.Reveal)){val f=value;transform=constrain(ImageTransform(start.scale+(target.scale-start.scale)*f,start.x+(target.x-start.x)*f,start.y+(target.y-start.y)*f))}}
  }
+ val document=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/*")){uri->
+  val original=export;export=null
+  if(uri!=null&&original!=null)scope.launch{downloading=true;try{writeImage(context,uri,original);Toast.makeText(context,"图片已保存",Toast.LENGTH_SHORT).show()}catch(e:CancellationException){throw e}catch(_:Exception){Toast.makeText(context,"图片保存失败，请重试",Toast.LENGTH_LONG).show()}finally{downloading=false}}
+ }
+ fun download(){if(downloading||export!=null)return;downloading=true;scope.launch{
+  try{
+   val original=originalImage(repo.originalImage(message,id));val name="ThreadBridge-${id.take(12)}-${System.currentTimeMillis()}.${original.extension}"
+   if(Build.VERSION.SDK_INT>=29){downloadImage(context,original,name);Toast.makeText(context,"已保存到相册 Pictures/ThreadBridge",Toast.LENGTH_LONG).show()}
+   else{export=original;document.launch(name)}
+  }catch(e:CancellationException){throw e}catch(_:Exception){export=null;Toast.makeText(context,"图片保存失败，请检查连接或存储空间后重试",Toast.LENGTH_LONG).show()}finally{downloading=false}
+ }}
  Dialog(onDismissRequest=close,properties=DialogProperties(usePlatformDefaultWidth=false,decorFitsSystemWindows=false)) {
-  Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).windowInsetsPadding(WindowInsets.safeDrawing)) {
-   Box(Modifier.fillMaxSize().padding(top=64.dp,bottom=footerHeight+8.dp).onSizeChanged{viewport=it;motion?.cancel();transform=constrain(transform)}.clipToBounds()
-    .semantics{contentDescription="图片预览";stateDescription="缩放 ${(transform.scale*100).roundToInt()}%"}
-    .pointerInput(id){detectTapGestures(onDoubleTap={point->
-     val target=if(transform.scale>1.05f)ImageTransform()else imageGesture(transform,2.5f,0f,0f,point.x,point.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat())
-     animate(target)
-    })}
-    .pointerInput(id){detectTransformGestures{centroid,pan,zoom,_->
-     motion?.cancel();transform=imageGesture(transform,zoom,pan.x,pan.y,centroid.x,centroid.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat())
-    }},contentAlignment=Alignment.Center) {
-    Image(bitmap.asImageBitmap(),null,Modifier.fillMaxSize().graphicsLayer{scaleX=transform.scale;scaleY=transform.scale;translationX=transform.x;translationY=transform.y},contentScale=ContentScale.Fit)
-   }
-   Row(Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(horizontal=12.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically){
-    BridgeIconButton(onClick=close){Icon(BridgeIcons.Close,"关闭图片预览",Modifier.size(20.dp))}
-    Text("图片",fontSize=15.sp,modifier=Modifier.weight(1f).padding(start=8.dp))
-    if(loading)CircularProgressIndicator(Modifier.padding(14.dp).size(20.dp),strokeWidth=2.dp)
-   }
-   Column(Modifier.align(Alignment.BottomCenter).onSizeChanged{footerHeight=with(density){it.height.toDp()}}.padding(bottom=12.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(8.dp)){
-    Surface(shape=CircleShape,color=MaterialTheme.colorScheme.surfaceContainerLow){
-     Row(Modifier.padding(horizontal=8.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)){
-      BridgeIconButton(onClick={animate(ImageTransform(maxOf(1f,transform.scale/1.5f),transform.x,transform.y))},enabled=transform.scale>1.01f){Icon(BridgeIcons.Minus,"缩小图片",Modifier.size(20.dp))}
-      Text("${(transform.scale*100).roundToInt()}%",fontSize=13.sp,modifier=Modifier.widthIn(min=44.dp))
-      BridgeIconButton(onClick={animate(ImageTransform(minOf(5f,transform.scale*1.5f),transform.x,transform.y))},enabled=transform.scale<4.99f){Icon(BridgeIcons.Add,"放大图片",Modifier.size(20.dp))}
-      TextButton(onClick={animate(ImageTransform())},enabled=transform.scale>1.01f){Text("复位",fontSize=13.sp)}
+  val dialogWindow=(LocalView.current.parent as? DialogWindowProvider)?.window
+  val dark=isSystemInDarkTheme()
+  SideEffect{dialogWindow?.let{window->WindowCompat.getInsetsController(window,window.decorView).apply{isAppearanceLightStatusBars=!dark;isAppearanceLightNavigationBars=!dark}}}
+  Box(Modifier.fillMaxSize()) {
+   backdrop?.let{Image(it.asImageBitmap(),null,Modifier.fillMaxSize(),contentScale=ContentScale.FillBounds)}
+   Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.scrim.copy(alpha=0.42f)))
+   Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+    Box(Modifier.fillMaxSize().onSizeChanged{viewport=it;motion?.cancel();transform=constrain(transform)}.clipToBounds()
+     .semantics{contentDescription="图片预览";stateDescription="缩放 ${(transform.scale*100).roundToInt()}%";onClick("关闭图片预览"){close();true}}
+     .pointerInput(id){detectTapGestures(onTap={point->
+      if(!imageContains(transform,point.x,point.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat()))close()
+     },onDoubleTap={point->
+      if(!imageContains(transform,point.x,point.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat()))close()
+      else{val target=if(transform.scale>1.05f)ImageTransform()else imageGesture(transform,2.5f,0f,0f,point.x,point.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat());animate(target)}
+     })}
+     .pointerInput(id){detectTransformGestures{centroid,pan,zoom,_->
+      motion?.cancel();transform=imageGesture(transform,zoom,pan.x,pan.y,centroid.x,centroid.y,viewport.width.toFloat(),viewport.height.toFloat(),bitmap.width.toFloat(),bitmap.height.toFloat())
+     }},contentAlignment=Alignment.Center) {
+     Image(bitmap.asImageBitmap(),null,Modifier.fillMaxSize().graphicsLayer{scaleX=transform.scale;scaleY=transform.scale;translationX=transform.x;translationY=transform.y},contentScale=ContentScale.Fit)
+    }
+    if(failed)Surface(shape=CircleShape,color=MaterialTheme.colorScheme.surface,modifier=Modifier.align(Alignment.BottomStart).padding(16.dp)){
+     TextButton(onClick={attempt++}){Text("重试加载清晰图片",fontSize=12.sp)}
+    }
+    Surface(shape=CircleShape,color=MaterialTheme.colorScheme.surface,shadowElevation=2.dp,modifier=Modifier.align(Alignment.BottomEnd).padding(16.dp)){
+     BridgeIconButton(onClick=::download,enabled=!downloading&&export==null){
+      if(downloading)CircularProgressIndicator(Modifier.size(20.dp),strokeWidth=2.dp)
+      else Icon(BridgeIcons.Download,"下载图片",Modifier.size(22.dp))
      }
     }
-    if(failed)TextButton(onClick={attempt++}){Text("重试加载清晰图片",fontSize=12.sp)}
-    else Text("双指缩放 · 双击放大",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
    }
   }
  }

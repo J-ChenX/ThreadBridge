@@ -39,9 +39,11 @@ M04 将已完成轮次、用户输入与发送回执转换为 ThreadBridge 投�
 
 当前 queue/resume 发送人类原文，不附加内部 UUID。队列确认使用持久命令账本、准确输入摘要、发送时间、前轮 revision、同 host/thread 和唯一活动候选；条件不足保持未确认。电脑同时提交相同原文仍缺上游端到端请求 ID 证明。`capture --store-candidates` 保留有界多标记 UUID 候选，供历史兼容回归使用；resume 按权威 turn ID 关联，不给人类输入添加内部标记。
 
+本机持续同步遇到已保存副本在当前原生索引中没有记录时，保留副本并跳过该记录的实时历史刷新，不将正常的历史留存作为全局投影失败。索引查询本身失败、仍有索引但历史文件缺失或解析失败继续告警并重试；不通过删除健康状态文件压制真实故障。
+
 ## 可见历史补录
 
-`capture-backfill --database CAPTURE --index STATE --thread ID` 在 collection、来源及归档过滤后读取原生历史，只补录人类文字、内联 PNG/JPEG/WebP 图片、助手 `commentary` 和已确认最终回复。图片每张最多 2 MiB、源库图片合计 64 MiB；过程说明合计 32 MiB；超限报告错误。工具调用、工具输出、推理及文件修改卡片排除。原生记录保持只读。
+`capture-backfill --database CAPTURE --index STATE --thread ID` 在 collection、来源及归档过滤后读取原生历史，只补录人类文字、内联 PNG/JPEG/WebP 图片、助手 `commentary` 和已确认最终回复。图片解码后每张最多 20 MiB，包含全部 base64 图片的原生 JSONL 单行也最多 20 MiB；源库图片合计 64 MiB；过程说明合计 32 MiB；超限报告错误。完成事件轮询窗口为 32 MiB，容纳接近单行上限的多图消息及前一轮确认记录。工具调用、工具输出、推理及文件修改卡片排除。原生记录保持只读。
 
 `capture-sync ... --native-index STATE` 按原生文件变化补录已捕获对话，包含尚未结束或被中断轮次中的可见文字，不将其升级成完成结果。消息 ID、原始时间与最终回复的既有 `notify:turn` ID 保持稳定，重复回填不会重复显示。新增附件、过程说明及导入游标纳入副本删除和 collection 重置；`GET /v1/threads/{id}/messages/{message}/images/{image}` 要求手机鉴权并验证消息仍存在。
 
@@ -61,4 +63,20 @@ grant 必须显式绑定原 thread/host/cwd、CLI 版本、权限、工具兼容
 
 ## 项目与手机新建
 
-项目归属由原生已登记项目及根目录匹配线程 cwd，兼容 worktree；项目 ID、名称、根目录进入独立 `captured_projects`、`captured_project_names` 及 `captured_project_catalog` 副本表，不导入旧对话正文。无元数据的旧来源显示“项目待同步”。`new_threads.rs` 在已验证启用 queue 的设备侧执行 `thread/start`，继承桌面既有权限并以真实原 ID queue 第一条人类文字；持久意图先于创建，原 ID 落库先于 queue，创建/queue 未知时不重试。原始 Codex 记录不因手机缓存清理而修改。手机接口与查询合同见 [通信与存储](通信与存储.md#项目与手机新建)。新建需要匹配版本的 Hub、bridge 和远端 helper，APK 安装不会升级电脑服务。
+项目归属由原生已登记项目及根目录匹配线程 cwd，兼容 worktree；项目 ID、名称、根目录进入独立 `captured_projects`、`captured_project_names` 及 `captured_project_catalog` 副本表，不导入旧对话正文。无元数据的旧来源显示“项目待同步”。`new_threads.rs` 在已验证启用 queue 的设备侧执行 `thread/start`，继承桌面既有权限并以真实原 ID queue 第一条人类文字；持久意图先于创建，原 ID 落库先于 queue；桌面控制 socket 不存在时，仅在 thread/start 前改用独立 stdio app-server。新线程通过 thread/name/set 持久化后才调用 queue，避免只有内存 ID 时队列读不到 rollout。初始化两种连接均失败时明确拒绝，创建、命名或 queue 结果未知时不重试。原始 Codex 记录不因手机缓存清理而修改。手机接口与查询合同见 [通信与存储](通信与存储.md#项目与手机新建)。新建需要匹配版本的 Hub、bridge 和远端 helper，APK 安装不会升级电脑服务。
+
+## 压缩记录与安装目录变化
+
+Codex 可将历史记录压缩为 `.jsonl.zst`，而 `state_5.sqlite` 仍保留原 `.jsonl` 路径。采集器优先读取索引指定文件；仅在文件不存在时查找同路径的 `.zst`，以有界解压读取完成事件、用户消息和可见历史。解压后的字节计入扫描预算，仍检查会话身份和允许目录；不会解压写回原目录或修改 Codex 索引。原有 `poll` 失败在实际读取、保存成功后自动消除，不通过删除 health 文件恢复。
+
+Windows 桌面升级可能更换 `OpenAI/Codex/bin/<16位哈希>/codex.exe`。配置路径缺失时，只在同一安装 `bin` 目录存在唯一匹配的可执行文件时使用它；缺失或有歧义则报错。此路径发现不会更改 `verified_version`，新版本仍须单独验证后才能开启 queue。其他安装布局需要显式更新配置。
+
+## 交互问题同步
+
+`questions.rs` 将原生 `response_item.function_call` 中明确的 `request_user_input_async` / `request_user_input` 转成独立问题投影；其他工具调用、工具结果和推理仍不进入消息。问题携带原问题 ID、标题、选项、时间及 pending/answered/closed/failed 状态，保存在 `captured_questions`，通过 `role=question` 消息进入 Hub。问题可早于第一次最终回复保存；已有采集对话的本机 `capture-sync --native-index` 和远端 poll 都在历史刷新时提取，不等待该轮完成通知。未进入本机采集目录的新对话仍需原有发现流程；远端 poll 按最近 200 个及 collection 策略发现。
+
+异步工具返回 `{accepted:true}` 只表示提问已登记，不是人类回答。只有具备人类 `user.text` 元数据、且包含准确 `questionItemId` 和原问题文字的原生回复记录，才将相应卡片更新为已回答；同批其他问题保持独立。同步阻塞问题的工具响应只用于更新状态，不将完整工具输出导入手机；`isSecret` 问题不生成手机表单。单个问题投影最多 12,000 UTF-8 字节、每次扫描最多 1,000 个，问题副本总正文预算 32 MiB，超限明确失败。远端 snapshot 的 revision 包含问题正文与状态，状态改变不依赖 count/max(rowid)；poll 版本提升后重新提取既有记录。
+
+手机异步回答使用安装版原生问题回复封装，经现有受版本验证的 queue 路线发送到原 thread ID；不能借此接管原生阻塞 RPC。提交和分发前核对问题仍待回答、原问题 ID/标题及主机/对话；远端可用已核验的待回答问题确认目标，不要求该对话已有首条最终回复。Hub 对过期问题返回 `question_no_longer_pending`，不创建第二次发送意图。队列 ACK 仍显示尚未确认；没有原生回答记录时不提前关闭卡片。结果未知不自动重发，桌面未激活时仍可能等待。电脑端直接关闭/跳过而没有原生回复记录时，当前无法据此推断问题已处理。
+
+删除、collection 清理、远端失败隔离和恢复计划绑定均覆盖 `captured_questions`，保留原生记录。上线需要一起升级 Hub、本机/远端采集器和 Android APK；旧 APK 不识别结构化问题卡片。`test_questions.py` 验证无最终回复时的问答投影、手机 HTTP 请求、精确原 ID、幂等、过期回答拒绝和删除后不回填；Rust 回归覆盖远端问题状态 revision、工具过滤及原记录保留。

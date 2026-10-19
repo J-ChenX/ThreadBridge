@@ -15,6 +15,10 @@ object ReceiptPresentation {
   "unknown"->"结果未知，请勿重复发送";"expired"->"请求已过期";"cancelled"->"已取消";"history_loaded"->"历史已更新";else->"已拒绝"
  }
  fun errorLabel(code:String)=when(code){
+  "question_no_longer_pending"->"这个问题已在其他端处理，请同步查看。"
+  "invalid_question_reply"->"回答内容无效，请检查后重试。"
+  "creation_executor_unavailable"->"电脑创建服务暂不可用，消息未发送，请恢复服务后再试。"
+  "creation_unconfirmed_no_retry"->"未能确认新对话是否创建，请在电脑核对结果，勿重复发送。"
   "user_action_required"->"后台未授权并已停止。请在电脑核对审批或输入后继续原任务，不要重复发送。"
   "desktop_dynamic_tool_unavailable"->"原任务需要桌面工具，后台无法调用。请在电脑继续原任务，不要重复发送。"
   "interrupted_resume_no_retry","upstream_timeout","upstream_disconnected"->"后台执行结果未确认，已停止自动提交；请核对电脑原任务。"
@@ -22,3 +26,5 @@ object ReceiptPresentation {
  }
  fun hint(status:String?,captureMode:Boolean)=if(status=="upstream_queued"&&captureMode)"桌面任务未激活时可能等待；请勿重复发送。" else if(captureMode)"仅显示启用后的最终回复，不包含原任务完整历史。" else null
 }
+/** The immutable send ledger owns submitted text, including uncertain requests. */
+internal fun composerSubmitted(status:String)=status in setOf("submitting","accepted","dispatching","upstream_queued","codex_accepted","unknown")

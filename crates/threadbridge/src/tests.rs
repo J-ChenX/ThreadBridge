@@ -1,4 +1,72 @@
 use crate::{model::*, store::Store};
+
+#[test]
+fn hub_identity_is_unique_persistent_and_does_not_reset_legacy_data() {
+    let (dir, db, host, phone, snapshot) = setup();
+    let other = Store::open(&dir.path().join("other.sqlite")).unwrap();
+    let identity = db.hosts().unwrap()["hub_id"].clone();
+    assert!(uuid::Uuid::parse_str(identity.as_str().unwrap_or("")).is_ok());
+    assert_ne!(identity, other.hosts().unwrap()["hub_id"]);
+    let request = submit(&snapshot);
+    let command = db.submit(&phone, &request).unwrap();
+    db.0.lock()
+        .unwrap()
+        .execute("DELETE FROM settings WHERE k='hub_id'", [])
+        .unwrap();
+    let reopened = Store::open(&dir.path().join("db.sqlite")).unwrap();
+    let migrated = reopened.hosts().unwrap()["hub_id"].clone();
+    assert!(uuid::Uuid::parse_str(migrated.as_str().unwrap_or("")).is_ok());
+    assert_eq!(
+        reopened.hosts().unwrap()["collection_generation"],
+        "initial"
+    );
+    assert!(reopened.valid_device(&host) && reopened.valid_device(&phone));
+    assert_eq!(
+        reopened
+            .command(&phone, request.request_id.as_str())
+            .unwrap()["id"],
+        command["id"]
+    );
+    assert_eq!(
+        reopened.threads(0).unwrap()["threads"][0]["id"],
+        snapshot.thread.id
+    );
+    assert_eq!(
+        Store::open(&dir.path().join("db.sqlite"))
+            .unwrap()
+            .hosts()
+            .unwrap()["hub_id"],
+        migrated
+    );
+    let code = reopened.pair_code().unwrap();
+    assert_eq!(
+        reopened.pair(&code, "new phone").unwrap()["hub_id"],
+        migrated
+    );
+}
+
+#[test]
+fn replacement_hosts_take_priority_over_revoked_or_expired_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Store::open(&dir.path().join("db.sqlite")).unwrap();
+    for i in 0..4 {
+        let (host, _) = db.credential("agent", &format!("old {i}")).unwrap();
+        if i % 2 == 0 {
+            db.revoke(&host).unwrap();
+        } else {
+            db.0.lock()
+                .unwrap()
+                .execute("UPDATE devices SET expires=0 WHERE id=?1", [&host])
+                .unwrap();
+        }
+    }
+    let (replacement, _) = db.credential("agent", "replacement").unwrap();
+    db.heartbeat(&replacement).unwrap();
+    let response = db.hosts().unwrap();
+    assert_eq!(response["hosts"][0]["id"], replacement);
+    assert_eq!(response["hosts"][0]["online"], true);
+    assert_eq!(response["hosts"].as_array().unwrap().len(), 4);
+}
 fn setup() -> (tempfile::TempDir, Store, String, String, Snapshot) {
     let dir = tempfile::tempdir().unwrap();
     let db = Store::open(&dir.path().join("db.sqlite")).unwrap();

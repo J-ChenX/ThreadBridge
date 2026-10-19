@@ -58,6 +58,13 @@ pub async fn dispatch(
             current.0 == cmd.expected_revision && current.1,
             "queue_state_changed"
         );
+        if let Err(error) =
+            crate::questions::validate_reply(&c, "messages", &cmd.thread_id, &cmd.text)
+        {
+            drop(c);
+            db.receipt(host, &cmd.id, "rejected", None, Some(&error.to_string()))?;
+            return Ok(());
+        }
         c.execute(
             "INSERT INTO capture_queue_ledger(id,status) VALUES(?1,'intent')",
             [&cmd.id],

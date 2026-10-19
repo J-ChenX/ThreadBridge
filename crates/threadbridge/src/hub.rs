@@ -44,6 +44,8 @@ fn bad(e: anyhow::Error) -> ApiError {
         "revision_conflict",
         "queue_full",
         "thread_command_pending",
+        "question_no_longer_pending",
+        "invalid_question_reply",
     ];
     if known.contains(&text.as_str()) {
         ApiError(StatusCode::CONFLICT, text)

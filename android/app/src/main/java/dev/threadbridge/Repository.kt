@@ -21,7 +21,7 @@ class ApiException(val code:Int,val reason:String):Exception(reason)
 data class MessageCursor(val ordinal:Long,val id:String)
 class Repository(context:Context) {
  companion object { @Volatile private var instance:Repository?=null; fun get(context:Context):Repository=instance?:synchronized(this){instance?:Repository(context.applicationContext).also{instance=it}} }
- val db=Room.databaseBuilder(context,BridgeDatabase::class.java,"threadbridge.sqlite").addMigrations(object:Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("CREATE TABLE IF NOT EXISTS `chunks` (`threadId` TEXT NOT NULL, `messageId` TEXT NOT NULL, `version` TEXT NOT NULL, `offset` INTEGER NOT NULL, `text` TEXT NOT NULL, PRIMARY KEY(`threadId`,`messageId`,`version`,`offset`))")}},object:Migration(2,3){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `sync` ADD COLUMN `generation` TEXT NOT NULL DEFAULT ''");db.execSQL("CREATE TABLE IF NOT EXISTS `hosts` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `online` INTEGER NOT NULL, PRIMARY KEY(`id`))")}},object:Migration(3,4){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `messageRevision` INTEGER NOT NULL DEFAULT 0");db.execSQL("ALTER TABLE `threads` ADD COLUMN `messageActivityAt` INTEGER NOT NULL DEFAULT 0")}},object:Migration(4,5){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `project` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `threads` ADD COLUMN `localOnly` INTEGER NOT NULL DEFAULT 0");db.execSQL("ALTER TABLE `messages` ADD COLUMN `timestamp` INTEGER NOT NULL DEFAULT 0");db.execSQL("CREATE TABLE IF NOT EXISTS `projects` (`hostId` TEXT NOT NULL, `path` TEXT NOT NULL, PRIMARY KEY(`hostId`,`path`))");db.execSQL("UPDATE `messages` SET `timestamp`=`ordinal` WHERE `ordinal`>0")}},object:Migration(5,6){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `projectName` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `projects` ADD COLUMN `name` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `threads` ADD COLUMN `projectKnown` INTEGER NOT NULL DEFAULT 0")}}).build()
+ val db=Room.databaseBuilder(context,BridgeDatabase::class.java,"threadbridge.sqlite").addMigrations(object:Migration(1,2){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("CREATE TABLE IF NOT EXISTS `chunks` (`threadId` TEXT NOT NULL, `messageId` TEXT NOT NULL, `version` TEXT NOT NULL, `offset` INTEGER NOT NULL, `text` TEXT NOT NULL, PRIMARY KEY(`threadId`,`messageId`,`version`,`offset`))")}},object:Migration(2,3){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `sync` ADD COLUMN `generation` TEXT NOT NULL DEFAULT ''");db.execSQL("CREATE TABLE IF NOT EXISTS `hosts` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `online` INTEGER NOT NULL, PRIMARY KEY(`id`))")}},object:Migration(3,4){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `messageRevision` INTEGER NOT NULL DEFAULT 0");db.execSQL("ALTER TABLE `threads` ADD COLUMN `messageActivityAt` INTEGER NOT NULL DEFAULT 0")}},object:Migration(4,5){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `project` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `threads` ADD COLUMN `localOnly` INTEGER NOT NULL DEFAULT 0");db.execSQL("ALTER TABLE `messages` ADD COLUMN `timestamp` INTEGER NOT NULL DEFAULT 0");db.execSQL("CREATE TABLE IF NOT EXISTS `projects` (`hostId` TEXT NOT NULL, `path` TEXT NOT NULL, PRIMARY KEY(`hostId`,`path`))");db.execSQL("UPDATE `messages` SET `timestamp`=`ordinal` WHERE `ordinal`>0")}},object:Migration(5,6){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `projectName` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `projects` ADD COLUMN `name` TEXT NOT NULL DEFAULT ''");db.execSQL("ALTER TABLE `threads` ADD COLUMN `projectKnown` INTEGER NOT NULL DEFAULT 0")}},object:Migration(6,7){override fun migrate(db:androidx.sqlite.db.SupportSQLiteDatabase){db.execSQL("ALTER TABLE `threads` ADD COLUMN `displayHostId` TEXT NOT NULL DEFAULT ''")}},MIGRATION_7_9,MIGRATION_8_9).build()
  val dao=db.dao();val credentials=Credentials(context)
  internal val library=ConversationLibrary(context)
  internal val searchState=kotlinx.coroutines.flow.MutableStateFlow(ConversationSearchState())
@@ -29,7 +29,10 @@ class Repository(context:Context) {
  internal val readState=ConversationReadState(context)
  private val imageCache=java.io.File(context.cacheDir,"conversation-images")
  private val imageLock=Mutex()
- private val imageMemory=object:android.util.LruCache<String,android.graphics.Bitmap>(8*1024*1024){override fun sizeOf(key:String,value:android.graphics.Bitmap)=value.allocationByteCount}
+ private fun bitmapCache(bytes:Int)=object:android.util.LruCache<String,android.graphics.Bitmap>(bytes){override fun sizeOf(key:String,value:android.graphics.Bitmap)=value.allocationByteCount}
+ private val imageMemory=bitmapCache(16*1024*1024)
+ private val imagePreviews=bitmapCache(12*1024*1024)
+ private fun clearImageMemory(){imageMemory.evictAll();imagePreviews.evictAll()}
  private val capturePrefs=context.getSharedPreferences("capture_status",Context.MODE_PRIVATE)
  val captureWarning=MutableStateFlow<String?>(capturePrefs.getString("warning",null))
  val connection=MutableStateFlow("未连接")
@@ -51,7 +54,18 @@ class Repository(context:Context) {
  private data class DraftWrite(val draft:Draft?=null,val barrier:CompletableDeferred<Unit>?=null,val generation:Long=0)
  private val draftPreview=DraftPreviewCache()
  private val draftWrites=Channel<DraftWrite>(64)
- init { draftScope.launch { for(write in draftWrites){try{write.draft?.let{sessionGate.run(write.generation){val target=redirects.value[it.threadId]?:it.threadId;if(dao.thread(target)!=null)dao.putDraft(it.copy(threadId=target))};draftPreview.committed(it.threadId,write.generation,it.text)}}catch(_:CancellationException){}finally{write.barrier?.complete(Unit)}} } }
+ init { draftScope.launch { for(first in draftWrites){
+  val batch=mutableListOf(first)
+  while(batch.size<256){val next=draftWrites.tryReceive().getOrNull()?:break;batch+=next}
+  try {
+   for((generation,writes) in batch.filter{it.draft!=null}.groupBy{it.generation}){
+    // Keep the final write order when an old local ID redirects to a native ID.
+    val latest=latestDrafts(writes.map{it.draft!!})
+    try{sessionGate.run(generation){for(draft in latest){val target=redirects.value[draft.threadId]?:draft.threadId;if(dao.thread(target)!=null)dao.putDraft(draft.copy(threadId=target));draftPreview.committed(draft.threadId,generation,draft.text)}}}catch(_:CancellationException){}
+   }
+  }finally{batch.forEach{it.barrier?.complete(Unit)}}
+ } } }
+
  fun saveDraft(id:String,text:String){val generation=sessionGate.current();draftPreview.put(id,generation,text);val write=DraftWrite(Draft(id,text),generation=generation);if(draftWrites.trySend(write).isFailure)draftScope.launch(start=CoroutineStart.UNDISPATCHED){draftWrites.send(write)}}
  private suspend fun flushDrafts(){val done=CompletableDeferred<Unit>();draftWrites.send(DraftWrite(barrier=done));done.await()}
  suspend fun draft(id:String):String{
@@ -78,7 +92,7 @@ class Repository(context:Context) {
  }
  suspend fun pair(server:String,code:String,lan:Boolean){
   stopSession()
-  try {sessionGate.reset{val url=validateServer(server,lan);val r=request("/v1/pair",JSONObject().put("code",code.trim()).put("name","Android 主手机"),url,"");require(r.getInt("protocol")==1){"服务端协议版本不兼容"};withContext(Dispatchers.IO){db.clearAllTables();imageMemory.evictAll();imageCache.deleteRecursively()};readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();credentials.save(url,r.getString("token"),lan)}}
+  try {sessionGate.reset{val url=validateServer(server,lan);val r=request("/v1/pair",JSONObject().put("code",code.trim()).put("name","Android 主手机"),url,"");require(r.getInt("protocol")==1){"服务端协议版本不兼容"};withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();credentials.save(url,r.getString("token"),lan)}}
   finally { // reset has released its mutex and advanced the generation before workers start.
    foregroundScope?.takeIf{it.isActive}?.let{connect(it)}
   }
@@ -115,7 +129,7 @@ class Repository(context:Context) {
    socket?.cancel()
   }catch(e:CancellationException){throw e}catch(_:Exception){/* Keep the existing connection and retry later. */}
  }
- private suspend fun clearCachedContent(id:String){withContext(Dispatchers.IO){imageMemory.snapshot().keys.filter{it.startsWith("$id:")}.forEach{imageMemory.remove(it)};imageCache.listFiles()?.filter{it.name.contains("-$id-")}?.forEach{it.delete()}};dao.deleteThreadMessages(id);dao.deleteThreadChunks(id)}
+ private suspend fun clearCachedContent(id:String){withContext(Dispatchers.IO){listOf(imageMemory,imagePreviews).forEach{cache->cache.snapshot().keys.filter{it.startsWith("$id:")}.forEach{cache.remove(it)}};imageCache.listFiles()?.filter{it.name.contains("-$id-")}?.forEach{it.delete()}};dao.deleteThreadMessages(id);dao.deleteThreadChunks(id)}
  private suspend fun deleteCachedThread(id:String){clearCachedContent(id);dao.deleteThread(id);dao.deleteDraft(id);dao.deletePending(id)}
  private suspend fun syncInternal(){syncLock.withLock{try{
   migratePublicTestConnection()
@@ -133,7 +147,7 @@ class Repository(context:Context) {
   while(true){
    check(page.getString("collection_generation")==epoch){"同步已重置，请稍后重试"}
    val a=page.getJSONArray("threads")
-   for(i in 0 until a.length()){val t=a.getJSONObject(i);rows+=ThreadRow(t.getString("id"),t.getString("title"),t.getString("host_id"),t.getString("status"),t.getString("revision"),t.getLong("updated_at"),t.getBoolean("can_send"),t.getBoolean("host_online"),if(t.isNull("history_cursor"))null else t.getString("history_cursor"),t.optLong("message_revision",0),t.optLong("message_activity_at",0),t.optString("project",""),projectName=t.optString("project_name",""),projectKnown=t.optBoolean("project_known",t.optString("project").isNotEmpty()))}
+   for(i in 0 until a.length()){val t=a.getJSONObject(i);rows+=ThreadRow(t.getString("id"),t.getString("title"),t.getString("host_id"),t.getString("status"),t.getString("revision"),t.getLong("updated_at"),t.getBoolean("can_send"),t.getBoolean("host_online"),if(t.isNull("history_cursor"))null else t.getString("history_cursor"),t.optLong("message_revision",0),t.optLong("message_activity_at",0),t.optString("project",""),projectName=t.optString("project_name",""),projectKnown=t.optBoolean("project_known",t.optString("project").isNotEmpty()),taskStatus=t.optString("task_status","unknown"),taskTurnId=t.optString("task_turn_id",""),displayHostId=t.optString("display_host_id",t.getString("host_id")))}
    count++;if(page.isNull("next_offset"))break
    val next=page.getLong("next_offset");require(next<=100000&&next==(count*50).toLong()){"对话列表分页异常"};page=request("/v1/threads?offset=$next")
   }
@@ -144,7 +158,7 @@ class Repository(context:Context) {
   rows.removeAll{library.expired(it)}
   rows.addAll(local.map{it.copy(online=hosts.find{h->h.id==it.hostId}?.online?:false)})
   val liveIds=rows.map{it.id}.toSet()
-  if(reset){withContext(Dispatchers.IO){imageMemory.evictAll();imageCache.deleteRecursively()};sessionGate.invalidateWithinOperation();draftPreview.clear();selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply()}
+  if(reset){withContext(Dispatchers.IO){clearImageMemory();imageCache.deleteRecursively()};sessionGate.invalidateWithinOperation();draftPreview.clear();selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply()}
   db.withTransaction{
    if(reset){dao.clearMessages();dao.clearChunks();dao.clearThreads();dao.clearDrafts();dao.clearPending();dao.clearHosts()}
    if(changes.optBoolean("snapshot_required",false)){dao.clearMessages();dao.clearChunks();dao.clearThreads()}
@@ -164,19 +178,32 @@ class Repository(context:Context) {
   library.remove(id)
   sessionGate.invalidateWithinOperation()
   db.withTransaction{deleteCachedThread(id)}
+  searchState.value=searchState.value.copy(rows=searchState.value.rows.filter{it.id!=id})
+  readState.restore(dao.allThreads())
   if(selected==id)selected=null
+ }
+ suspend fun deleteThreads(ids:Set<String>,deleted:(String)->Unit){
+  var count=0
+  for(id in ids){
+   try{deleteThread(id);count++;deleted(id)}
+   catch(e:CancellationException){throw e}
+   catch(e:Exception){throw IllegalStateException("已删除 $count 个，剩余 ${ids.size-count} 个未删除。${e.message?:"请检查连接后重试"}",e)}
+  }
  }
  private suspend fun checkEpoch(response:JSONObject){check(response.getString("collection_generation")==dao.generation()){"同步已重置，请刷新对话"}}
  private suspend fun loadCaptureHealth(){
   val warning=try {
    val response=request("/v1/capture-health");val hosts=response.getJSONArray("hosts");val now=response.getLong("server_time")
-   var count=0;var inputFailures=0;var overflow=false;var projectionError=false;var stale=false;var detail:String?=null
+   var count=0;var inputFailures=0;var overflow=false;var projectionError=false;var stale=false;val details=mutableListOf<String>()
+   val names=dao.allHosts().associate{it.id to it.name}
    for(i in 0 until hosts.length()){
     val host=hosts.getJSONObject(i);val status=host.getJSONObject("status");val failures=status.optJSONObject("failures")
+    val name=names[host.optString("host_id")]?:"电脑"
+    if(status.has("projection_error"))details+="$name：${CapturePresentation.projectionReason(status.optString("projection_error"))}"
     if(failures!=null)for(key in failures.keys()){if(failures.getJSONObject(key).optString("reason")=="user_input_capture_failed")inputFailures++ else count++};overflow=overflow||status.optBoolean("overflow");projectionError=projectionError||status.has("projection_error");stale=stale||now-host.getLong("checked_at")>30
-    if(failures!=null&&failures.length()>0){val failure=failures.getJSONObject(failures.keys().next());detail="会话 ${failure.optString("thread_id").take(8)}：${CapturePresentation.reason(failure.optString("reason"))}"}
+    if(failures!=null&&failures.length()>0){val failure=failures.getJSONObject(failures.keys().next());details+="$name · 会话 ${failure.optString("thread_id").take(8)}：${CapturePresentation.reason(failure.optString("reason"))}"}
    }
-   CapturePresentation.warning(count,overflow,projectionError,stale,hosts.length()==0,inputFailures)?.let{it+(detail?.let{d->"\n$d"}?:"")}
+   CapturePresentation.warning(count,overflow,projectionError,stale,hosts.length()==0&&(response.optJSONArray("offline_hosts")?.length()?:0)==0,inputFailures)?.let{it+details.distinct().take(4).joinToString("",transform={d->"\n$d"})}
   }catch(e:Exception){if(e is CancellationException)throw e;"无法核实电脑回复保存状态；已有内容仍可读取。"}
   captureWarning.value=warning;capturePrefs.edit().putString("warning",warning).apply()
  }
@@ -191,7 +218,9 @@ class Repository(context:Context) {
   if(thread.localOnly)return submitNew(thread,text)
   val id=UUID.randomUUID().toString();val p=JSONObject().put("request_id",id).put("thread_id",thread.id).put("text",text).put("expected_revision",thread.revision).put("created_at",System.currentTimeMillis()/1000).put("kind",if(history)"history" else "send").put("cursor",thread.historyCursor?:JSONObject.NULL)
   val snapshot=Pending(id,thread.id,p.toString(),"submitting",null,null);dao.putPending(snapshot)
-  return try{val r=request("/v1/commands",p);val updated=snapshot.copy(status=r.getString("status"),commandId=r.getString("id"));val committed=updatePending(updated);if(!history)dao.clearDraftIfMatches(thread.id,text);committed}catch(e:ApiException){if(e.code in listOf(400,401,403,409,413,429)){val failed=snapshot.copy(status="rejected",error=e.reason);updatePending(failed)}else{snapshot}}catch(e:Exception){if(e is CancellationException)throw e;snapshot}
+  val result=try{val r=request("/v1/commands",p);updatePending(snapshot.copy(status=r.getString("status"),commandId=r.getString("id")))}catch(e:ApiException){if(e.code in listOf(400,401,403,409,413,429)){val failed=snapshot.copy(status="rejected",error=e.reason);updatePending(failed)}else{snapshot}}catch(e:Exception){if(e is CancellationException)throw e;snapshot}
+  if(!history&&composerSubmitted(result.status))dao.clearDraftIfMatches(thread.id,text)
+  return result
  }
  private suspend fun reconcileInternal(){for(p in (dao.unresolved()+dao.localCreations()).distinctBy{it.requestId}){try{val r=request("/v1/commands/${p.requestId}");val updated=updatePending(p.copy(status=r.getString("status"),commandId=r.getString("id"),error=if(r.isNull("error"))null else r.getString("error")));adoptCreated(updated,r)}catch(e:Exception){if(e is CancellationException)throw e;/* Unknown submission stays immutable. */}}}
  private suspend fun adoptCreated(p:Pending,response:JSONObject){
@@ -204,7 +233,9 @@ class Repository(context:Context) {
  private suspend fun submitNew(thread:ThreadRow,text:String):Pending{
   val id=UUID.randomUUID().toString();val payload=JSONObject().put("request_id",id).put("host_id",thread.hostId).put("project",thread.project).put("text",text).put("created_at",System.currentTimeMillis()/1000).put("kind","create")
   val pending=Pending(id,thread.id,payload.toString(),"submitting",null,null);dao.putPending(pending)
-  return try{val r=request("/v1/threads/create",payload);val result=updatePending(pending.copy(status=r.getString("status"),commandId=r.getString("id")));dao.clearDraftIfMatches(thread.id,text);result}catch(e:ApiException){if(e.code in 400..499)updatePending(pending.copy(status="rejected",error=e.message))else pending}catch(e:Exception){if(e is CancellationException)throw e;pending}
+  val result=try{val r=request("/v1/threads/create",payload);updatePending(pending.copy(status=r.getString("status"),commandId=r.getString("id")))}catch(e:ApiException){if(e.code in 400..499)updatePending(pending.copy(status="rejected",error=e.message))else pending}catch(e:Exception){if(e is CancellationException)throw e;pending}
+  if(composerSubmitted(result.status))dao.clearDraftIfMatches(thread.id,text)
+  return result
  }
  suspend fun searchTitles(query:String)=sessionGate.run{
   if(query.isBlank()){searchState.value=ConversationSearchState();return@run}
@@ -213,7 +244,7 @@ class Repository(context:Context) {
   try{
    val rows=mutableListOf<ThreadRow>();var offset=0;var more=false
    do{val r=request("/v1/threads?q=${java.net.URLEncoder.encode(query,"UTF-8")}&offset=$offset");checkEpoch(r);val a=r.getJSONArray("threads")
-    for(i in 0 until a.length()){val t=a.getJSONObject(i);val row=ThreadRow(t.getString("id"),t.getString("title"),t.getString("host_id"),t.getString("status"),t.getString("revision"),t.getLong("updated_at"),t.getBoolean("can_send"),t.getBoolean("host_online"),if(t.isNull("history_cursor"))null else t.getString("history_cursor"),t.optLong("message_revision",0),t.optLong("message_activity_at",0),t.optString("project",""),projectName=t.optString("project_name",""),projectKnown=t.optBoolean("project_known",t.optString("project").isNotEmpty()));if(titleMatches(row.title,query))rows+=row}
+    for(i in 0 until a.length()){val t=a.getJSONObject(i);val row=ThreadRow(t.getString("id"),t.getString("title"),t.getString("host_id"),t.getString("status"),t.getString("revision"),t.getLong("updated_at"),t.getBoolean("can_send"),t.getBoolean("host_online"),if(t.isNull("history_cursor"))null else t.getString("history_cursor"),t.optLong("message_revision",0),t.optLong("message_activity_at",0),t.optString("project",""),projectName=t.optString("project_name",""),projectKnown=t.optBoolean("project_known",t.optString("project").isNotEmpty()),taskStatus=t.optString("task_status","unknown"),taskTurnId=t.optString("task_turn_id",""),displayHostId=t.optString("display_host_id",t.getString("host_id")));if(titleMatches(row.title,query))rows+=row}
     more=!r.isNull("next_offset");if(more)offset=r.getInt("next_offset")
    }while(more&&offset<1000)
    searchState.value=ConversationSearchState((rows+local).distinctBy{it.id},more=more)
@@ -234,35 +265,66 @@ class Repository(context:Context) {
  private suspend fun retryPendingInternal(p:Pending){require(p.status=="submitting");check(dao.pendingById(p.requestId)!=null);try{val found=request("/v1/commands/${p.requestId}");updatePending(p.copy(status=found.getString("status"),commandId=found.getString("id")));return}catch(e:ApiException){if(e.code!=404)throw e}
   val json=JSONObject(p.payload);if(System.currentTimeMillis()/1000-json.getLong("created_at")>120){updatePending(p.copy(status="expired",error="提交窗口已过期，未查询到回执"));return};val r=request(if(json.optString("kind")=="create")"/v1/threads/create"else"/v1/commands",json);updatePending(p.copy(status=r.getString("status"),commandId=r.getString("id")))
  }
- suspend fun userImage(m:MessageRow,image:String,maxDimension:Int=720):android.graphics.Bitmap=sessionGate.run{withContext(Dispatchers.IO){imageLock.withLock{
+ private fun imageKey(m:MessageRow,image:String,dimension:Int,generation:Long=sessionGate.current())="${m.threadId}:$generation:$image:$dimension"
+ fun cachedUserImage(m:MessageRow,image:String,dimension:Int=720):android.graphics.Bitmap?=(if(dimension<=720)imageMemory else imagePreviews).get(imageKey(m,image,dimension))
+ private suspend fun imageFile(m:MessageRow,image:String):java.io.File {
   require(image.matches(Regex("[a-f0-9]{64}")))
-  require(maxDimension in 256..1600)
   check(dao.thread(m.threadId)!=null){"对话已删除"}
   val namespace=java.security.MessageDigest.getInstance("SHA-256").digest((credentials.server+credentials.token()+dao.generation()).toByteArray()).joinToString(""){"%02x".format(it)}
-  val memoryKey="${m.threadId}:$namespace:$image:$maxDimension"
-  imageMemory.get(memoryKey)?.let{return@withLock it}
-  val file=java.io.File(imageCache,"$namespace-${m.threadId}-$image")
-  val bytes=if(file.exists())file.readBytes()else{
+  return java.io.File(imageCache,"$namespace-${m.threadId}-$image")
+ }
+ private suspend fun imageBytes(m:MessageRow,image:String,generation:Long):ByteArray {
+  val file=imageFile(m,image)
+  val cache=ImageDiskCache(imageCache)
+  cache.read(file,image)?.let{return it}
+  return sessionGate.run(generation){
+   check(dao.thread(m.threadId)!=null){"对话已删除"}
    val message=java.net.URLEncoder.encode(m.id,"UTF-8")
-   val r=request("/v1/threads/${m.threadId}/messages/$message/images/$image",maxBytes=3*1024*1024);checkEpoch(r)
+   val r=request("/v1/threads/${m.threadId}/messages/$message/images/$image",maxBytes=28*1024*1024);checkEpoch(r)
    val data=android.util.Base64.decode(r.getString("base64"),android.util.Base64.DEFAULT)
-   require(data.size<=2*1024*1024)
-   val digest=java.security.MessageDigest.getInstance("SHA-256").digest(data).joinToString(""){"%02x".format(it)}
-   check(digest==image){"图片校验失败"}
-   imageCache.mkdirs()
-   var used=imageCache.listFiles()?.sumOf{it.length()}?:0
-   for(old in imageCache.listFiles()?.sortedBy{it.lastModified()}?:emptyList()){if(used+data.size<=64*1024*1024)break;val size=old.length();if(old.delete())used-=size}
-   file.writeBytes(data);data
+   require(data.size<=20*1024*1024)
+   cache.write(file,image,data);data
   }
-  val options=android.graphics.BitmapFactory.Options().apply{inJustDecodeBounds=true}
-  android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.size,options)
-  require(options.outWidth>0&&options.outHeight>0){"无法读取图片"}
-  options.inJustDecodeBounds=false;options.inSampleSize=bitmapSample(options.outWidth,options.outHeight,maxDimension)
-  (android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.size,options)?:error("无法读取图片")).also{imageMemory.put(memoryKey,it)}
- }}}
+ }
+ // Local hits never queue behind a full network synchronization. Preview bitmaps
+ // have a separate budget so opening a photo cannot evict conversation thumbnails.
+ suspend fun userImage(m:MessageRow,image:String,maxDimension:Int=720):android.graphics.Bitmap {
+  require(maxDimension in 256..1600)
+  val generation=sessionGate.current();val key=imageKey(m,image,maxDimension,generation)
+  val memory=if(maxDimension<=720)imageMemory else imagePreviews
+  memory.get(key)?.let{return it}
+  return withContext(Dispatchers.IO){imageLock.withLock{
+   memory.get(key)?.let{return@withLock it}
+   val bytes=imageBytes(m,image,generation)
+   val options=android.graphics.BitmapFactory.Options().apply{inJustDecodeBounds=true}
+   android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.size,options)
+   require(options.outWidth>0&&options.outHeight>0){"无法读取图片"}
+   options.inJustDecodeBounds=false;options.inSampleSize=bitmapSample(options.outWidth,options.outHeight,maxDimension)
+   val bitmap=android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.size,options)?:error("无法读取图片")
+   if(generation!=sessionGate.current())throw CancellationException("Connection changed")
+   memory.put(key,bitmap);bitmap
+  }}
+ }
+ suspend fun originalImage(m:MessageRow,image:String):ByteArray {
+  val generation=sessionGate.current()
+  return withContext(Dispatchers.IO){imageLock.withLock{
+   val bytes=imageBytes(m,image,generation)
+   if(generation!=sessionGate.current())throw CancellationException("Connection changed")
+   bytes
+  }}
+ }
  suspend fun sync()=sessionGate.run{syncInternal()}
  suspend fun loadMessages(id:String,before:Long?=null,beforeId:String?=null)=sessionGate.run{loadMessagesInternal(id,before,beforeId)}
  suspend fun chunk(m:MessageRow,offset:Int)=sessionGate.run{chunkInternal(m,offset)}
+ suspend fun answerQuestion(message:MessageRow,answer:String):Pending=sessionGate.run {
+  val current=dao.message(message.threadId,message.id)
+  check(current?.version==message.version){"问题已更新，请同步后重试"}
+  val question=QuestionPresentation.parse(current!!)
+  check(question?.canReply==true){"此问题已处理或需要在电脑端回答"}
+  val thread=dao.thread(message.threadId)?:error("此对话已删除")
+  check(thread.canSend&&thread.online){"电脑当前无法接收回答"}
+  submitInternal(thread,QuestionPresentation.reply(question!!,answer))
+ }
  suspend fun submit(thread:ThreadRow,text:String,history:Boolean=false):Pending {val generation=sessionGate.current();flushDrafts();return sessionGate.run(generation){submitInternal(thread,text,history)}}
  suspend fun cancel(p:Pending)=sessionGate.run{cancelInternal(p)}
  suspend fun retryPending(p:Pending)=sessionGate.run{retryPendingInternal(p)}
@@ -272,7 +334,11 @@ class Repository(context:Context) {
   session=scope.launch {
    sessionGate.run{cleanupLocal()}
    val wake=Channel<Unit>(Channel.CONFLATED)
-   launch { for(signal in wake){try{sync()}catch(e:CancellationException){throw e}catch(_:Exception){}} }
+   launch { for(signal in wake){try{sync()}catch(e:CancellationException){
+    // A collection baseline can invalidate an operation queued behind it.
+    // Keep the live event consumer; true session cancellation still propagates.
+    currentCoroutineContext().ensureActive();wake.trySend(Unit)
+   }catch(_:Exception){}} }
    launch { pollingFallback.collectLatest { while(isActive){wake.trySend(Unit);delay(if(polling())3000 else 15000)} } }
    val currentSession=currentCoroutineContext()[Job]!!
    var failures=0
@@ -304,5 +370,5 @@ class Repository(context:Context) {
  }
  private fun stopSession(){session?.cancel();session=null;socket?.cancel();socket=null}
  fun close(){stopSession();foregroundScope=null}
- suspend fun forget(){stopSession();sessionGate.reset{credentials.clear();readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();withContext(Dispatchers.IO){db.clearAllTables();imageMemory.evictAll();imageCache.deleteRecursively()};selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply();httpHealthy=false;connectionIssue.value=null;connection.value="未连接"}}
+ suspend fun forget(){stopSession();sessionGate.reset{credentials.clear();readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply();httpHealthy=false;connectionIssue.value=null;connection.value="未连接"}}
 }

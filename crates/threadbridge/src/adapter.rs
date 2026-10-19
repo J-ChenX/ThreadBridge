@@ -43,6 +43,23 @@ impl Adapter {
         verified: Option<&str>,
         home: Option<&Path>,
     ) -> Result<Self> {
+        Self::connect_transport(codex, socket, verified, home, true).await
+    }
+    /// New threads can use a standalone server when no desktop control socket
+    /// exists. Fallback happens before thread/start; no creation is replayed.
+    pub async fn connect_for_creation(codex: &Path, verified: &str, home: &Path) -> Result<Self> {
+        match Self::connect_with_home(codex, None, Some(verified), Some(home)).await {
+            Ok(adapter) => Ok(adapter),
+            Err(_) => Self::connect_transport(codex, None, Some(verified), Some(home), false).await,
+        }
+    }
+    async fn connect_transport(
+        codex: &Path,
+        socket: Option<&Path>,
+        verified: Option<&str>,
+        home: Option<&Path>,
+        proxy: bool,
+    ) -> Result<Self> {
         let version = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new(codex)
@@ -54,7 +71,11 @@ impl Adapter {
         let version = String::from_utf8(version.stdout)?.trim().to_string();
         let allow_send = verified.is_some_and(|v| v == version);
         let mut cmd = tokio::process::Command::new(codex);
-        cmd.args(["app-server", "proxy"]);
+        cmd.args(if proxy {
+            ["app-server", "proxy"]
+        } else {
+            ["app-server", "--stdio"]
+        });
         if let Some(home) = home {
             cmd.env("CODEX_HOME", home);
         }
@@ -77,7 +98,7 @@ impl Adapter {
             allow_send,
             version,
         };
-        a.rpc("initialize",json!({"clientInfo":{"name":"threadbridge","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
+        a.rpc("initialize",json!({"clientInfo":{"name":"threadbridge","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
         a.input
             .write_all(b"{\"method\":\"initialized\",\"params\":{}}\n")
             .await?;

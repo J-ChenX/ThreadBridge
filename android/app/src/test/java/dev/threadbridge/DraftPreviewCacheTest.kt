@@ -18,4 +18,13 @@ class DraftPreviewCacheTest {
   val cache=DraftPreviewCache();cache.put("a",1,"");cache.put("b",1,"text")
   assertEquals("",cache.get("a",1));assertEquals("text",cache.get("b",1))
  }
+ @Test fun queuedTypingKeepsEachThreadsLatestValueIncludingClear() {
+  val writes=(1..100).map{Draft("a","text $it")}+Draft("b","other draft")+Draft("a","")
+  assertEquals(listOf(Draft("b","other draft"),Draft("a","")),latestDrafts(writes))
+ }
+ @Test fun coalescingPreservesFinalOrderWhenLocalAndNativeIdsShareADestination() {
+  val writes=listOf(Draft("local","older"),Draft("native","newer"),Draft("local",""))
+  val final=latestDrafts(writes).associate{(if(it.threadId=="local")"native"else it.threadId) to it.text}
+  assertEquals("",final["native"])
+ }
 }

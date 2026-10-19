@@ -9,12 +9,23 @@ def main():
     root = Path(__file__).resolve().parents[2]
     source = (root/'android/app/src/main/java/dev/threadbridge/Repository.kt').read_text()
     schemas = root/'android/app/schemas/dev.threadbridge.BridgeDatabase'
-    target = json.loads((schemas/'6.json').read_text())['database']
+    database_source = (root/'android/app/src/main/java/dev/threadbridge/Database.kt').read_text()
+    target_version = int(re.search(r'version=(\d+),exportSchema=true', database_source).group(1))
+    assert target_version >= max(int(path.stem) for path in schemas.glob('*.json')), 'Room version regressed below a delivered schema'
+    target = json.loads((schemas/f'{target_version}.json').read_text())['database']
+    metadata_source = (root/'android/app/src/main/java/dev/threadbridge/DatabaseMigrations.kt').read_text()
+    metadata_statements = [json.loads(sql) for sql in re.findall(r'db\.execSQL\(("(?:[^"\\]|\\.)*")\)', metadata_source)]
+    assert len(metadata_statements) == 3
+    assert 'MIGRATION_7_9' in source and 'MIGRATION_8_9' in source
+    source += '\n' + metadata_source
     migrations = {}
-    for start, end, body in re.findall(r'object\s*:\s*Migration\((\d+),(\d+)\)\s*\{override fun migrate\([^)]*\)\{(.*?)\}\}', source, re.S):
-        migrations[int(start)] = (int(end), [json.loads(sql) for sql in re.findall(r'db\.execSQL\(("(?:[^"\\]|\\.)*")\)', body)])
-    for version in (1, 2, 3, 4, 5):
-        old = json.loads((schemas/f'{version}.json').read_text())['database']
+    for start, end, body in re.findall(r'object\s*:\s*(?:androidx\.room\.migration\.)?Migration\((\d+),(\d+)\)\s*\{\s*override\s+fun\s+migrate\([^)]*\)\s*\{(.*?)\}\s*\}', source, re.S):
+        migrations[int(start)] = (int(end), [json.loads(sql) for sql in re.findall(r'db\.execSQL\(("(?:[^"\\]|\\.)*")\)', body)], 'completeThreadMetadata(db)' in body)
+    fixtures = [schemas/f'{version}.json' for version in range(1, target_version)]
+    fixtures.append(root/'tests/fixtures/android/room-7-task-state.json')
+    for fixture in fixtures:
+        old = json.loads(fixture.read_text())['database']
+        version = old['version']
         db = sqlite3.connect(':memory:')
         snapshots = {}
         for entity in old['entities']:
@@ -25,9 +36,12 @@ def main():
             db.execute(f'INSERT INTO `{table}` VALUES({",".join("?" for _ in values)})', values)
             snapshots[table] = (columns, tuple(values))
         current = version
-        while current < 6:
-            next_version, statements = migrations[current]
-            assert statements and next_version > current
+        while current < target_version:
+            next_version, statements, metadata = migrations[current]
+            assert (statements or metadata) and next_version > current
+            if metadata:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(threads)')}
+                statements = [sql for sql in metadata_statements if re.search(r'ADD COLUMN `([^`]+)`', sql).group(1) not in columns]
             for statement in statements:
                 db.execute(statement)
             current = next_version
@@ -46,7 +60,7 @@ def main():
                 assert db.execute(f'SELECT {quoted} FROM `{table}`').fetchone() == values
         assert db.execute('SELECT messageRevision,messageActivityAt FROM threads').fetchone() == ((1, 1) if version >= 4 else (0, 0))
         db.close()
-    print('Room migration: 1/2/3/4/5 -> 6 match exported columns and defaults; existing threads, messages, drafts, pending requests and sync data preserved')
+    print(f'Room migration: 1–8 and both delivered Room 7 shapes -> {target_version}; existing thread/task/display metadata, messages, drafts, pending requests and sync data preserved; schema version cannot regress')
 
 
 if __name__ == '__main__':

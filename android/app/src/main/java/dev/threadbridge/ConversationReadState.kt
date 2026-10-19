@@ -28,9 +28,12 @@ internal class ConversationReadState(context:Context) {
   val editor=prefs.edit();prefs.all.keys.filter{it!="collection"&&it !in live}.forEach{editor.remove(it)};editor.apply()
  }
  fun markRead(thread:ThreadRow) {
+  markRead(listOf(thread))
+ }
+ fun markRead(threads:List<ThreadRow>) {
   if(!initialized)return
-  val stamp=conversationReadStamp(thread)
-  prefs.edit().putString(thread.id,stamp).apply();stamps=stamps+(thread.id to stamp)
+  val markers=threads.associate{it.id to conversationReadStamp(it)}
+  val editor=prefs.edit();markers.forEach{(id,stamp)->editor.putString(id,stamp)};editor.apply();stamps=stamps+markers
   unread.value=unreadConversations(rows,stamps)
  }
  fun clear(){prefs.edit().clear().apply();rows=emptyList();stamps=emptyMap();initialized=false;unread.value=emptySet()}
@@ -41,7 +44,7 @@ internal fun conversationActivity(thread:ThreadRow)=maxOf(thread.updated*1000,th
 internal fun unreadConversations(threads:List<ThreadRow>,read:Map<String,String>)=threads.filter{read[it.id]!=conversationReadStamp(it)}.map{it.id}.toSet()
 internal data class DeviceGroup(val host:HostRow,val threads:List<ThreadRow>,val preview:List<ThreadRow>,val unread:Boolean)
 internal fun deviceGroups(hosts:List<HostRow>,threads:List<ThreadRow>,unread:Set<String>,pinned:Set<String> = emptySet()):List<DeviceGroup> {
- val byHost=threads.groupBy{it.hostId}
+ val byHost=threads.groupBy{it.groupHostId}
  return hosts.map{host->
  val group=byHost[host.id].orEmpty().sortedWith(compareByDescending<ThreadRow>{conversationActivity(it)}.thenBy{it.id})
  val recent=group.groupBy{it.project to it.projectKnown}.values.flatMap{it.take(3)}.map{it.id}.toSet()

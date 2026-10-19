@@ -30,8 +30,8 @@ import kotlinx.coroutines.flow.collectLatest
  }else BridgeIconButton(onClick=onClick,content=content)
 }
 
-@Composable internal fun ConversationHeader(navigation:@Composable ()->Unit) {
- Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout.only(WindowInsetsSides.Top))).padding(horizontal=12.dp,vertical=4.dp),verticalAlignment=Alignment.CenterVertically){navigation()}
+@Composable internal fun ConversationHeader(navigation:@Composable ()->Unit,thread:ThreadRow?) {
+ Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout.only(WindowInsetsSides.Top))).padding(horizontal=12.dp,vertical=4.dp),verticalAlignment=Alignment.CenterVertically){navigation();Spacer(Modifier.weight(1f));ConversationTaskStatus(thread,Modifier.padding(15.dp))}
 }
 
 /** Keep the scroll viewport behind the chrome. The keyboard changes its bounds.

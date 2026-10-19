@@ -4,9 +4,32 @@ use crate::{collection, health, native_capture, native_input};
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs::File, io::BufReader, path::Path};
+use std::{
+    collections::BTreeMap,
+    io::{BufReader, Read},
+    path::Path,
+};
 
 pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
+    backfill_bounded(database, index, native, native_input::MAX_SCAN)
+}
+
+/// Remote polling reserves this scan from its aggregate per-request budget.
+pub fn backfill_bounded(
+    database: &Path,
+    index: &Path,
+    native: &str,
+    max_scan: usize,
+) -> Result<usize> {
+    backfill_source(database, index, native, max_scan, None)
+}
+pub(crate) fn backfill_source(
+    database: &Path,
+    index: &Path,
+    native: &str,
+    max_scan: usize,
+    input: Option<&mut dyn Read>,
+) -> Result<usize> {
     uuid::Uuid::parse_str(native)?;
     let _guard = collection::lock(database)?;
     if !collection::allowed(database, Some(index), native)? {
@@ -23,8 +46,18 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         [],
         |r| r.get(0),
     )?;
-    let mut stream = BufReader::new(File::open(path)?);
+    let mut owned = if input.is_none() {
+        Some(crate::rollout::reader(Path::new(&path))?)
+    } else {
+        None
+    };
+    let mut stream = BufReader::new(match input {
+        Some(input) => input,
+        None => owned.as_mut().unwrap().as_mut(),
+    });
+    let mut questions = crate::questions::Scan::default();
     let mut identity = false;
+    let mut task: Option<(String, String)> = None;
     let mut used = 0;
     let mut users = BTreeMap::<String, Vec<native_input::UserMessage>>::new();
     let mut comments = Vec::<(String, String, String, i64)>::new();
@@ -34,13 +67,16 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
     let mut empty_finals = BTreeMap::<String, bool>::new();
     let mut empty_completions = BTreeMap::<String, bool>::new();
     loop {
-        let line = native_capture::read_bounded_line(&mut stream, native_input::MAX_LINE)?;
+        let line = native_capture::read_bounded_line(
+            &mut stream,
+            native_input::MAX_LINE.min(max_scan.saturating_sub(used)),
+        )?;
         if line.is_empty() {
             break;
         }
         used += line.len();
         ensure!(
-            line.len() <= native_input::MAX_LINE && used <= native_input::MAX_SCAN,
+            line.len() <= native_input::MAX_LINE && used <= max_scan.min(native_input::MAX_SCAN),
             "visible_history_limit"
         );
         let record: Value = match serde_json::from_slice(&line) {
@@ -70,6 +106,7 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         if !identity {
             continue;
         }
+        questions.record(&record)?;
         if record["type"] == "response_item" && p["type"] == "message" {
             let meta = &p["internal_chat_message_metadata_passthrough"];
             let Some(turn) = meta["turn_id"].as_str() else {
@@ -134,6 +171,25 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
                 }
             }
         }
+        if record["type"] == "event_msg" {
+            let status = match p["type"].as_str() {
+                Some("task_started") => Some("running"),
+                Some("task_complete") => Some(if p["error"].is_null() {
+                    "completed"
+                } else {
+                    "failed"
+                }),
+                Some("turn_aborted" | "task_interrupted") => Some("interrupted"),
+                _ => None,
+            };
+            if let (Some(status), Some(turn)) = (status, p["turn_id"].as_str()) {
+                uuid::Uuid::parse_str(turn)?;
+                // A late completion for an older turn cannot stop a newer task.
+                if status == "running" || task.as_ref().is_none_or(|(id, _)| id == turn) {
+                    task = Some((turn.into(), status.into()));
+                }
+            }
+        }
         if record["type"] == "event_msg" && p["type"] == "task_complete" {
             let turn = p["turn_id"]
                 .as_str()
@@ -191,8 +247,14 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         }
     }
     let mut db = native_capture::open_database(database)?;
+    // A question can precede the first completion in this capture database.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS captured_replies(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,reply TEXT NOT NULL,utf8_bytes INTEGER NOT NULL,captured_at INTEGER NOT NULL,title TEXT NOT NULL DEFAULT '',PRIMARY KEY(thread_id,turn_id))")?;
     db.execute_batch("CREATE TABLE IF NOT EXISTS captured_visible_messages(thread_id TEXT NOT NULL,turn_id TEXT NOT NULL,message_id TEXT NOT NULL,text TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(thread_id,message_id))")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS captured_task_state(thread_id TEXT PRIMARY KEY,turn_id TEXT NOT NULL,status TEXT NOT NULL)")?;
     let tx = db.transaction()?;
+    if let Some((turn, status)) = task {
+        tx.execute("INSERT INTO captured_task_state VALUES(?1,?2,?3) ON CONFLICT(thread_id) DO UPDATE SET turn_id=excluded.turn_id,status=excluded.status WHERE turn_id<>excluded.turn_id OR status<>excluded.status", params![native,turn,status])?;
+    }
     for (turn, id, text, stamp) in &comments {
         let old: Option<(String,String,i64)> = tx.query_row("SELECT turn_id,text,created_at FROM captured_visible_messages WHERE thread_id=?1 AND message_id=?2",params![native,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         ensure!(
@@ -217,7 +279,11 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         }
     }
     tx.commit()?;
+    for (_, id, text, _) in &comments {
+        crate::message_images::capture(&mut db, native, &format!("native:{id}"), text)?;
+    }
     count += comments.len();
+    questions.save(&mut db, native)?;
     let title: Option<String> = db
         .query_row(
             "SELECT title FROM captured_replies WHERE thread_id=?1 ORDER BY rowid DESC LIMIT 1",
@@ -226,6 +292,7 @@ pub fn backfill(database: &Path, index: &Path, native: &str) -> Result<usize> {
         )
         .optional()?;
     for (turn, (text, stamp)) in confirmed {
+        crate::message_images::capture(&mut db, native, &format!("notify:{turn}"), &text)?;
         let exists: bool = db.query_row(
             "SELECT count(*)>0 FROM captured_replies WHERE thread_id=?1 AND turn_id=?2",
             params![native, turn],

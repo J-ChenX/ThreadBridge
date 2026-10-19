@@ -3,8 +3,10 @@ mod agent;
 mod capture;
 mod collection;
 mod collection_reset;
+mod desktop_projects;
 mod health;
 mod hub;
+mod message_images;
 mod model;
 mod native_capture;
 mod native_fleet;
@@ -17,8 +19,10 @@ mod notify;
 #[cfg(unix)]
 mod probe;
 mod project_metadata;
+mod questions;
 mod queue;
 mod replica_cleanup;
+mod rollout;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -517,7 +521,7 @@ async fn main() -> Result<()> {
             anyhow::ensure!(!output.exists(), "refusing to overwrite credential file");
             let db = Store::open(&db)?;
             let count: i64 = db.0.lock().unwrap().query_row(
-                "SELECT COUNT(*) FROM devices WHERE role='agent' AND revoked=0",
+                "SELECT COUNT(*) FROM devices WHERE role='agent' AND revoked=0 AND expires>strftime('%s','now')",
                 [],
                 |r| r.get(0),
             )?;

@@ -6,11 +6,16 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::BufReader, path::Path, time::Duration};
+use std::{io::BufReader, path::Path, time::Duration};
 
-pub const MAX_LINE: usize = 4 * 1024 * 1024;
 pub const MAX_SCAN: usize = 256 * 1024 * 1024;
 pub const MAX_INPUT: usize = 256 * 1024;
+const MAX_IMAGES: usize = 16;
+const MAX_ENCODED_IMAGE: usize = MAX_LINE;
+pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+// A native JSONL record contains all images in a message, not just its text.
+// Keep the whole record bounded independently of each image and text limit.
+pub const MAX_LINE: usize = 20 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserMessage {
@@ -106,10 +111,10 @@ pub fn parse_user(payload: &Value) -> Result<Option<UserMessage>> {
                 "data:image/webp;base64" => "image/webp",
                 _ => bail!("user_image_format_unsupported"),
             };
-            ensure!(encoded.len() <= 3 * 1024 * 1024, "user_image_limit");
+            ensure!(encoded.len() <= MAX_ENCODED_IMAGE, "user_image_limit");
             let bytes = STANDARD.decode(encoded).context("user_image_invalid")?;
             ensure!(
-                !bytes.is_empty() && bytes.len() <= 2 * 1024 * 1024 && images.len() < 16,
+                !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES && images.len() < MAX_IMAGES,
                 "user_image_limit"
             );
             let id = format!("{:x}", Sha256::digest(&bytes));
@@ -187,7 +192,7 @@ pub fn read_turn(index: &Path, native: &str, turn: &str) -> Result<(Vec<UserMess
         .optional()?;
     let rollout = rollout.context("user_turn_source_missing")?;
     drop(db);
-    let mut stream = BufReader::new(File::open(rollout)?);
+    let mut stream = BufReader::new(crate::rollout::reader(Path::new(&rollout))?);
     let mut rows = Vec::new();
     let mut used = 0;
     let mut identity = false;
@@ -315,8 +320,21 @@ pub fn save_messages(
                     [],
                     |r| r.get(0),
                 )?;
+                let assistant_used: i64 = if tx.query_row(
+                    "SELECT count(*)>0 FROM sqlite_master WHERE name='captured_assistant_images'",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )? {
+                    tx.query_row(
+                        "SELECT coalesce(sum(length(bytes)),0) FROM captured_assistant_images",
+                        [],
+                        |r| r.get(0),
+                    )?
+                } else {
+                    0
+                };
                 ensure!(
-                    used + image.bytes.len() as i64 <= 64 * 1024 * 1024,
+                    used + assistant_used + image.bytes.len() as i64 <= 64 * 1024 * 1024,
                     "image_storage_budget"
                 );
                 tx.execute(

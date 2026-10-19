@@ -82,6 +82,12 @@ pub fn read(index: &Path) -> Result<BTreeMap<String, String>> {
 /// Repair only existing replicas, including threads outside the recent poll window.
 pub fn refresh(database: &Path, index: &Path) -> Result<BTreeMap<String, String>> {
     let titles = read(index)?;
+    persist(database, index, &titles)?;
+    Ok(titles)
+}
+
+/// Names have their own replica, including tasks without a completed reply.
+pub fn persist(database: &Path, index: &Path, titles: &BTreeMap<String, String>) -> Result<()> {
     let _guard = crate::collection::lock(database)?;
     let mut c = Connection::open(database)?;
     c.busy_timeout(Duration::from_secs(3))?;
@@ -89,11 +95,27 @@ pub fn refresh(database: &Path, index: &Path) -> Result<BTreeMap<String, String>
         .prepare("PRAGMA table_info(captured_replies)")?
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|column| column == "title") {
-        return Ok(titles);
+    let has_reply_titles = columns.iter().any(|column| column == "title");
+    c.execute_batch("CREATE TABLE IF NOT EXISTS captured_thread_titles(thread_id TEXT PRIMARY KEY,title TEXT NOT NULL)")?;
+    let mut sources = Vec::new();
+    for table in [
+        "captured_replies",
+        "captured_task_state",
+        "captured_questions",
+    ] {
+        if c.query_row(
+            "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |r| r.get::<_, bool>(0),
+        )? {
+            sources.push(format!("SELECT thread_id FROM {table}"));
+        }
+    }
+    if sources.is_empty() {
+        return Ok(());
     }
     let natives = c
-        .prepare("SELECT DISTINCT thread_id FROM captured_replies LIMIT 100001")?
+        .prepare(&format!("{} LIMIT 100001", sources.join(" UNION ")))?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ensure!(natives.len() <= 100000, "thread_title_catalog_limit");
@@ -107,13 +129,16 @@ pub fn refresh(database: &Path, index: &Path) -> Result<BTreeMap<String, String>
     }
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (native, title) in selected {
-        tx.execute(
-            "UPDATE captured_replies SET title=?1 WHERE thread_id=?2 AND title<>?1",
-            params![title, native],
-        )?;
+        tx.execute("INSERT INTO captured_thread_titles VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET title=excluded.title WHERE title<>excluded.title", params![native,title])?;
+        if has_reply_titles {
+            tx.execute(
+                "UPDATE captured_replies SET title=?1 WHERE thread_id=?2 AND title<>?1",
+                params![title, native],
+            )?;
+        }
     }
     tx.commit()?;
-    Ok(titles)
+    Ok(())
 }
 
 #[cfg(test)]

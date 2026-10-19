@@ -9,7 +9,9 @@
 
 ThreadBridge 是面向个人的自部署工具：电脑运行 Hub 和接入组件，手机安装 APK 并配对。可连接多台电脑，按设备、项目组织对话，读取用户消息、图片、助手过程说明和最终回复，并按原 thread ID 继续对话。项目独立维护，与 OpenAI 官方产品无隶属关系。
 
-当前 Android 版本为 **0.1.21-test**，核心 CLI 包版本为 **0.1.0**。已有四机接入及指定原对话续聊的运行记录；完整日常使用、24–72 小时稳定性、真机锁屏推送和资源预算仍需验收。指定版本、单次续聊或模拟器通过不能代表所有 Codex 版本均兼容。
+Android 的已交付基线与候选版本统一记录在 [android/release.properties](android/release.properties)，Gradle 和校验工具共同读取；debug 版本追加 `-debug`，不作为安装包交付。核心 CLI 包版本为 **0.1.0**。已有四机接入及指定原对话续聊的运行记录；完整日常使用、24–72 小时稳定性、真机锁屏推送和资源预算仍需验收。指定版本、单次续聊或模拟器通过不能代表所有 Codex 版本均兼容。
+
+开发和交付必须遵循根目录 [AGENTS.md](AGENTS.md)，发布规则回归运行 `python3 tests/test_release_policy.py`。
 
 [下载 APK](https://github.com/J-ChenX/ThreadBridge/releases) · [安装与配置](docs/运行与安装.md) · [报告问题](https://github.com/J-ChenX/ThreadBridge/issues/new/choose) · [参与贡献](CONTRIBUTING.md)
 
@@ -23,11 +25,11 @@ ThreadBridge 是面向个人的自部署工具：电脑运行 Hub 和接入组�
 
 默认不会开启未验证的写能力。队列提交与 Codex 执行分开显示；不确定发送保持 `unknown`，不能靠重发消除。新对话采集使用持久 collection 策略；删除操作只影响 ThreadBridge 副本，保留原 Codex 记录。
 
-当前不支持手机发送附件、运行中追加/打断、远程审批或通知栏回复。它不提供任意终端或远程桌面能力。手机读取的是已授权同步的内容；工具调用、工具输出和内部推理不进入对话列表。
+当前不支持手机发送附件、运行中追加/打断、远程审批或通知栏回复。它不提供任意终端或远程桌面能力。手机读取的是已授权同步的内容；交互问题以独立卡片同步，异步问题可明确提交回答；其他工具调用、工具输出和内部推理不进入对话列表。
 
 ## 下载与开始使用
 
-1. 打开 [Releases](https://github.com/J-ChenX/ThreadBridge/releases)，选择最新测试版，下载 **Assets** 中的 `ThreadBridge-*.apk`；源码压缩包不是安装包。
+1. 打开 [Releases](https://github.com/J-ChenX/ThreadBridge/releases)，选择适用版本，下载 **Assets** 中的 `ThreadBridge-*.apk`；源码压缩包不是安装包。
 2. 在 Android 8.0 及以上设备安装。旧版使用同签名 APK 直接覆盖升级；不要通过卸载绕过升级问题。
 3. 在电脑构建并配置 ThreadBridge Hub/接入组件，按 [运行与安装](docs/运行与安装.md)生成配对码或手机访问密钥。
 4. 手机连接自己的 Hub。公开 APK 不预置个人服务器或凭证；公网使用 HTTPS，HTTP 仅用于显式启用的受信任局域网测试。
@@ -37,7 +39,7 @@ ThreadBridge 是面向个人的自部署工具：电脑运行 Hub 和接入组�
 下载校验文件并与 APK 放在同一目录，可在支持 `sha256sum` 的电脑上校验：
 
 ```sh
-sha256sum --check ThreadBridge-0.1.21.apk.sha256
+sha256sum --check ThreadBridge-*.apk.sha256
 ```
 
 ## 工作方式
@@ -86,7 +88,7 @@ android/gradlew -p android :app:testDebugUnitTest --no-daemon --no-parallel
 android/gradlew -p android :app:assembleDebug :app:lintDebug --no-daemon --no-parallel
 ```
 
-Release APK 使用 `scripts/build-apk.sh`，需要原签名文件与密码环境变量，输出 `artifacts/ThreadBridge-0.1.21.apk` 和 SHA-256。推送匹配 `versionName` 的版本标签（例如 `v0.1.21-test`）后，GitHub Actions 自动构建、校验并上传到 [Releases](https://github.com/J-ChenX/ThreadBridge/releases)；首次 Secrets 配置见 [开发与发布](docs/开发与发布.md#自动发布-apk)。源码仓库不包含 APK、实际服务配置或签名材料。覆盖升级必须沿用原签名。
+Release APK 使用 `scripts/build-apk.sh PREVIOUS.apk`，需要原签名文件与密码环境变量，并验证真实上一版与登记身份一致。输出为 `artifacts/ThreadBridge-<versionName>.apk`、SHA-256 和 `.verification.json`，验证报告必须含 `delivery_approved: true`。推送与候选版本匹配的稳定版本标签后，GitHub Actions 按相同门禁构建并发布；配置与上一版要求见 [开发与发布](docs/开发与发布.md#自动发布-apk)。安装包通过 GitHub Releases 单独分发；源码仓库不包含 APK、实际服务配置或签名材料。覆盖升级必须沿用原签名。
 
 ## 使用与维护
 
@@ -96,7 +98,7 @@ Release APK 使用 `scripts/build-apk.sh`，需要原签名文件与密码环境
 - [Codex 接入边界](docs/modules/Codex接入.md)、[通信与存储](docs/modules/通信与存储.md)、[Android 客户端](docs/modules/Android客户端.md)
 - [开发、验证与 GitHub 发布](docs/开发与发布.md)及[测试入口](tests/README.md)
 
-## 最近版本
+## 历史公开版本
 
 完整公开版本记录见 [CHANGELOG](CHANGELOG.md)，下载和每次发布的提交列表见 [Releases](https://github.com/J-ChenX/ThreadBridge/releases)。
 

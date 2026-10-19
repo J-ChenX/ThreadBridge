@@ -73,11 +73,13 @@ class MainActivity:ComponentActivity() {
   super.onCreate(savedInstanceState);enableEdgeToEdge();repo=Repository.get(applicationContext);handle(intent)
   lifecycleScope.launch { repeatOnLifecycle(Lifecycle.State.STARTED) { repo.connect(this);try{awaitCancellation()}finally{repo.close()} } }
   setContent {
+   // Observe navigation in the root composition before entering theme slots.
+   val activeDestination=destination.value
    val dark=isSystemInDarkTheme()
    val colors=if(dark)darkColorScheme(primary=Color(0xFFF5F5F5),onPrimary=Color(0xFF171717),background=Color(0xFF212121),surface=Color(0xFF212121),surfaceContainerLow=Color(0xFF2F2F2F),surfaceContainer=Color(0xFF2F2F2F),outline=Color(0xFF666666),surfaceContainerHigh=Color(0xFF383838),onSurface=Color(0xFFF0F0F0),onSurfaceVariant=Color(0xFFB5B5B5),outlineVariant=Color(0xFF404040))
     else lightColorScheme(primary=Color(0xFF171717),onPrimary=Color.White,background=Color.White,surface=Color.White,surfaceContainerLow=Color(0xFFF5F5F5),surfaceContainer=Color(0xFFF5F5F5),outline=Color(0xFFB7B7B7),surfaceContainerHigh=Color(0xFFEEEEEE),onSurface=Color(0xFF171717),onSurfaceVariant=Color(0xFF686868),outlineVariant=Color(0xFFE8E8E8))
    SideEffect { WindowCompat.getInsetsController(window,window.decorView).apply { isAppearanceLightStatusBars=!dark;isAppearanceLightNavigationBars=!dark } }
-   MaterialTheme(colorScheme=colors) { BridgeInteractionTheme{App(repo,destination.value){destination.value=it}} }
+   MaterialTheme(colorScheme=colors) { BridgeInteractionTheme{App(repo,activeDestination){destination.value=it}} }
   }
  }
  override fun onNewIntent(intent:Intent){super.onNewIntent(intent);handle(intent)}
@@ -95,18 +97,23 @@ private fun stateLabel(status:String)=when(status) {
  // An empty unpaired drawer has overlapping anchors. Recreate its state when
  // authenticated content appears so the first connection lands on the home page.
  val drawer=key(paired){rememberDrawerState(DrawerValue.Closed)}
- val threads by repo.dao.threads().collectAsStateWithLifecycle(initialValue=emptyList())
- val hosts by repo.dao.hosts().collectAsStateWithLifecycle(initialValue=emptyList())
- val projects by repo.dao.projects().collectAsStateWithLifecycle(initialValue=emptyList())
- val epoch by repo.collection.collectAsStateWithLifecycle()
- val unread by repo.readState.unread.collectAsStateWithLifecycle()
+ val threadFlow=remember(repo){repo.dao.threads()}
+ val hostFlow=remember(repo){repo.dao.hosts()}
+ val projectFlow=remember(repo){repo.dao.projects()}
+ // Read snapshots in this composition so nested Scaffold/Lazy content receives
+ // fresh parameters instead of retaining the initial captured list/read state.
+ val threads by rememberUpdatedState(threadFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
+ val hosts by rememberUpdatedState(hostFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
+ val projects by rememberUpdatedState(projectFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
+ val epoch by rememberUpdatedState(repo.collection.collectAsStateWithLifecycle().value)
+ val unread by rememberUpdatedState(repo.readState.unread.collectAsStateWithLifecycle().value)
  var searchOpen by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(false)}
  var query by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf("")}
- val search by repo.searchState.collectAsStateWithLifecycle()
+ val search by rememberUpdatedState(repo.searchState.collectAsStateWithLifecycle().value)
  LaunchedEffect(query,paired){if(paired){delay(250);repo.searchTitles(query)}}
- val visibleThreads=if(query.isBlank())threads else (search.rows.filter{titleMatches(it.title,query)}+threads.filter{titleMatches(it.title,query)}).distinctBy{it.id}
- val marks by repo.library.marks.collectAsStateWithLifecycle()
- val redirects by repo.redirects.collectAsStateWithLifecycle()
+ val visibleThreads by rememberUpdatedState(if(query.isBlank())threads else (search.rows.filter{titleMatches(it.title,query)}+threads.filter{titleMatches(it.title,query)}).distinctBy{it.id})
+ val marks by rememberUpdatedState(repo.library.marks.collectAsStateWithLifecycle().value)
+ val redirects by rememberUpdatedState(repo.redirects.collectAsStateWithLifecycle().value)
  LaunchedEffect(redirects,destination){redirects[destination]?.let{navigate(it)}}
  var newConversation by remember{mutableStateOf(false)}
  var favorites by remember{mutableStateOf(false)}
@@ -116,10 +123,20 @@ private fun stateLabel(status:String)=when(status) {
  fun toggleExpanded(id:String){expandedProjects=if(id in expandedProjects)expandedProjects-id else expandedProjects+id}
  var searchCollapsed by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(listOf<String>())}
  LaunchedEffect(query){searchCollapsed=emptyList()}
- val activeCollapsed=if(query.isBlank())collapsed else searchCollapsed
+ val activeCollapsed by rememberUpdatedState(if(query.isBlank())collapsed else searchCollapsed)
  var deleteTarget by remember{mutableStateOf<ThreadRow?>(null)}
  var confirmDelete by remember{mutableStateOf<ThreadRow?>(null)}
- val connection by repo.connection.collectAsStateWithLifecycle();val connectionIssue by repo.connectionIssue.collectAsStateWithLifecycle();val warning by repo.captureWarning.collectAsStateWithLifecycle()
+ var groupTarget by remember{mutableStateOf<ConversationScope?>(null)}
+ var selecting by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(false)}
+ var selectedIds by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(listOf<String>())}
+ var confirmBatch by remember{mutableStateOf<Set<String>?>(null)}
+ val snackbar=remember{SnackbarHostState()}
+ fun notify(text:String){scope.launch{snackbar.showSnackbar(text)}}
+ fun toggleSelection(id:String){selectedIds=if(id in selectedIds)selectedIds-id else selectedIds+id}
+ fun finishSelection(){selecting=false;selectedIds=emptyList();confirmBatch=null}
+ fun startSelection(id:String?=null){selecting=true;selectedIds=listOfNotNull(id);deleteTarget=null;focus.clearFocus();navigate(null);scope.launch{drawer.close()}}
+
+ val connection by rememberUpdatedState(repo.connection.collectAsStateWithLifecycle().value);val connectionIssue by rememberUpdatedState(repo.connectionIssue.collectAsStateWithLifecycle().value);val warning by rememberUpdatedState(repo.captureWarning.collectAsStateWithLifecycle().value)
  var error by remember{mutableStateOf<String?>(null)};var busy by remember{mutableStateOf(false)};var refreshing by remember{mutableStateOf(false)}
  var busyIndicator by remember{mutableStateOf(false)}
  LaunchedEffect(busy){if(busy){delay(180);busyIndicator=true}else busyIndicator=false}
@@ -128,10 +145,12 @@ private fun stateLabel(status:String)=when(status) {
  fun refresh(){if(refreshing)return;refreshing=true;scope.launch{try{repo.sync()}catch(e:CancellationException){throw e}catch(e:Exception){error=e.message?:"同步失败，请稍后重试"}finally{refreshing=false}}}
  fun open(id:String?){threads.find{it.id==id}?.let{repo.readState.markRead(it)};focus.clearFocus();navigate(id);scope.launch{drawer.close()}}
  LaunchedEffect(destination,paired){repo.selected=destination;if(paired)runCatching{repo.sync()}}
- BackHandler(paired&&(drawer.isOpen||destination!=null)){if(drawer.isOpen)scope.launch{drawer.close()}else navigate(null)}
+ BackHandler(paired&&(drawer.isOpen||destination!=null||selecting)){if(selecting){if(!busy)finishSelection()}else if(drawer.isOpen)scope.launch{drawer.close()}else navigate(null)}
+ LaunchedEffect(epoch){finishSelection();groupTarget=null}
+ LaunchedEffect(visibleThreads,selecting){if(selecting)selectedIds=selectedIds.filter{selected->visibleThreads.any{it.id==selected}}}
  LaunchedEffect(epoch){if(epoch.isNotEmpty()&&destination!=null&&repo.selected==null)navigate(null)}
- fun openResult(id:String){val row=visibleThreads.find{it.id==id};if(threads.none{it.id==id}&&row!=null)work{repo.restoreSearchedThread(row);open(id)}else open(id)}
- val current=threads.find{it.id==destination}
+ fun openResult(id:String){if(selecting){if(!busy)toggleSelection(id);return};val row=visibleThreads.find{it.id==id};if(threads.none{it.id==id}&&row!=null)work{repo.restoreSearchedThread(row);open(id)}else open(id)}
+ val current by rememberUpdatedState(threads.find{it.id==destination})
  fun toggle(id:String){if(query.isBlank())collapsed=if(id in collapsed)collapsed-id else collapsed+id else searchCollapsed=if(id in searchCollapsed)searchCollapsed-id else searchCollapsed+id}
  ModalNavigationDrawer(drawerState=drawer,gesturesEnabled=paired,drawerContent={
   if(paired)ModalDrawerSheet(drawerContainerColor=MaterialTheme.colorScheme.surfaceContainerLow,modifier=Modifier.width(300.dp)) {
@@ -143,31 +162,43 @@ private fun stateLabel(status:String)=when(status) {
    AnimatedVisibility(searchOpen,enter=expandVertically(expandFrom=Alignment.Top,animationSpec=tween(BridgeMotion.Reveal))+fadeIn(tween(BridgeMotion.Fade)),exit=shrinkVertically(shrinkTowards=Alignment.Top,animationSpec=tween(BridgeMotion.Icon))+fadeOut(tween(BridgeMotion.Press))){ConversationSearchField(query,{query=it},search.loading,search.offline)}
    val drawerList=rememberLazyListState();val deviceHeights=remember{mutableStateMapOf<String,Int>()};val deviceHeight=with(androidx.compose.ui.platform.LocalDensity.current){48.dp.roundToPx()}
    LazyColumn(Modifier.weight(1f),state=drawerList,contentPadding=PaddingValues(start=6.dp,end=6.dp,bottom=8.dp)){
-    deviceItems(hosts,visibleThreads,activeCollapsed,destination,::toggle,::openResult,{deleteTarget=it},unread,marks,true,expanded=expandedProjects.toSet(),toggleExpanded=::toggleExpanded,searching=query.isNotBlank(),pinnedProject={pinnedProjectKey(drawerList,it,visibleThreads,deviceHeights[it]?:deviceHeight)},onDeviceHeight={host,height->deviceHeights[host]=height})
+    deviceItems(hosts,visibleThreads,activeCollapsed,destination,::toggle,::openResult,{deleteTarget=it},unread,marks,true,expanded=expandedProjects.toSet(),toggleExpanded=::toggleExpanded,searching=query.isNotBlank(),pinnedProject={pinnedProjectKey(drawerList,it,visibleThreads,deviceHeights[it]?:deviceHeight)},onDeviceHeight={host,height->deviceHeights[host]=height},groupActions={groupTarget=it},selecting=selecting,selectedIds=selectedIds.toSet())
    }
   }
  }) {
   val navigationButton: @Composable ()->Unit={ConversationIconButton(floating=destination!=null,onClick={focus.clearFocus();scope.launch{drawer.open()}}){Icon(BridgeIcons.Menu,"打开对话列表")}}
   val moreButton: @Composable ()->Unit={Box{ConversationIconButton(floating=false,onClick={focus.clearFocus();menu=true}){Icon(BridgeIcons.More,"更多选项")};DropdownMenu(menu,{menu=false},modifier=Modifier.width(224.dp),shape=RoundedCornerShape(20.dp),containerColor=MaterialTheme.colorScheme.surfaceContainerLow,tonalElevation=0.dp,shadowElevation=6.dp){
+    BridgeMenuItem("多选会话",BridgeIcons.Check){menu=false;startSelection()}
     BridgeMenuItem("收藏对话",BridgeIcons.Star){menu=false;favorites=true}
     BridgeMenuItem("连接状态",BridgeIcons.Info){menu=false;details=true}
     BridgeMenuItem("设置",BridgeIcons.Settings){menu=false;settings=true}
    }}}
-  Scaffold(containerColor=MaterialTheme.colorScheme.background,
+  Scaffold(containerColor=MaterialTheme.colorScheme.background,snackbarHost={SnackbarHost(snackbar)},
    contentWindowInsets=if(paired&&destination!=null)WindowInsets(0,0,0,0)else ScaffoldDefaults.contentWindowInsets,
-   topBar={if(paired&&destination==null)TopAppBar(
+   topBar={if(paired&&destination==null&&selecting)TopAppBar(
+    expandedHeight=48.dp,title={Text("已选 ${selectedIds.size} 个",fontSize=18.sp)},
+    navigationIcon={BridgeIconButton(enabled=!busy,onClick={finishSelection()}){Icon(BridgeIcons.Close,"取消多选")}},
+    actions={val all=visibleThreads.isNotEmpty()&&visibleThreads.all{it.id in selectedIds};TextButton(enabled=!busy&&visibleThreads.isNotEmpty(),onClick={selectedIds=if(all)emptyList()else visibleThreads.map{it.id}}){Text(if(all)"取消全选"else"全选")};BridgeIconButton(enabled=!busy&&selectedIds.isNotEmpty(),onClick={confirmBatch=selectedIds.toSet()}){Icon(BridgeIcons.Delete,"删除选中的会话",tint=MaterialTheme.colorScheme.error)}},
+    colors=TopAppBarDefaults.topAppBarColors(containerColor=MaterialTheme.colorScheme.background))else if(paired&&destination==null)TopAppBar(
     expandedHeight=48.dp,
     title={Text("设备列表",fontSize=18.sp,fontWeight=FontWeight.SemiBold)},
     navigationIcon=navigationButton,actions={BridgeIconButton(active=searchOpen,onClick={searchOpen=!searchOpen;if(!searchOpen)query=""}){Icon(BridgeIcons.Search,"搜索对话标题")};BridgeIconButton(onClick={focus.clearFocus();newConversation=true}){Icon(BridgeIcons.Add,"新建对话")};moreButton()},
     colors=TopAppBarDefaults.topAppBarColors(containerColor=MaterialTheme.colorScheme.background))}) { padding->
+   val liveThreads by threadFlow.collectAsStateWithLifecycle(initialValue=emptyList())
+   val liveHosts by hostFlow.collectAsStateWithLifecycle(initialValue=emptyList())
+   val liveUnread by repo.readState.unread.collectAsStateWithLifecycle()
+   val liveSearch by repo.searchState.collectAsStateWithLifecycle()
+   val liveMarks by repo.library.marks.collectAsStateWithLifecycle()
+   val liveVisible=if(query.isBlank())liveThreads else (liveSearch.rows.filter{titleMatches(it.title,query)}+liveThreads.filter{titleMatches(it.title,query)}).distinctBy{it.id}
    Box(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding)) {
     if(!paired)PairScreen(busy,error){server,code,lan,direct->work{if(direct)repo.configureConnection(server,code,lan)else repo.pair(server,code,lan);paired=true;error=null}}
     else Column(Modifier.fillMaxSize()) {
      if(destination==null&&warning!=null)Row(Modifier.fillMaxWidth().softClickable{details=true}.heightIn(min=48.dp).padding(horizontal=20.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically){Icon(BridgeIcons.Info,null,tint=MaterialTheme.colorScheme.error,modifier=Modifier.size(14.dp));Spacer(Modifier.width(7.dp));Text(CapturePresentation.summary(warning!!),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.weight(1f));Text("查看",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}
      if(destination==null)AnimatedVisibility(searchOpen,enter=expandVertically(expandFrom=Alignment.Top,animationSpec=tween(BridgeMotion.Reveal))+fadeIn(tween(BridgeMotion.Fade)),exit=shrinkVertically(shrinkTowards=Alignment.Top,animationSpec=tween(BridgeMotion.Icon))+fadeOut(tween(BridgeMotion.Press))){ConversationSearchField(query,{query=it},search.loading,search.offline)}
      if(destination==null&&search.more)Text("仅显示前 1000 个匹配结果，请缩小关键词范围",fontSize=12.sp,modifier=Modifier.padding(horizontal=20.dp))
-     if(destination==null)ConversationList(hosts,visibleThreads,activeCollapsed,::toggle,::openResult,{deleteTarget=it},unread,marks,refreshing,::refresh,query.isNotBlank(),expandedProjects.toSet(),::toggleExpanded)
-     else key(destination,epoch){ChatScreen(repo,destination,current,busy,refreshing,::refresh,header={ConversationHeader(navigationButton)},work={work(it)})}
+     if(destination==null&&selecting)Text("点击选择会话；全选包含折叠中的对话",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(horizontal=20.dp,vertical=8.dp))
+     if(destination==null)ConversationList(liveHosts,liveVisible,activeCollapsed,::toggle,::openResult,{deleteTarget=it},liveUnread,liveMarks,refreshing,::refresh,query.isNotBlank(),expandedProjects.toSet(),::toggleExpanded,groupActions={groupTarget=it},selecting=selecting,selectedIds=selectedIds.toSet())
+     else key(destination,epoch){ChatScreen(repo,destination,liveThreads.find{it.id==destination},busy,refreshing,::refresh,header={ConversationHeader(navigationButton,liveThreads.find{it.id==destination})},work={work(it)})}
     }
     if(busyIndicator)LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp).align(Alignment.TopCenter),color=MaterialTheme.colorScheme.onSurface)
    }
@@ -177,13 +208,23 @@ private fun stateLabel(status:String)=when(status) {
   Text(displayTitle(deleteTarget!!,hosts),fontSize=16.sp,fontWeight=FontWeight.SemiBold,maxLines=2,overflow=TextOverflow.Ellipsis,modifier=Modifier.padding(horizontal=24.dp,vertical=12.dp))
   SheetAction(if(deleteTarget!!.id in marks.pinned)"取消置顶"else"置顶对话",if(deleteTarget!!.id in marks.pinned)BridgeIcons.PinFilled else BridgeIcons.Pin){repo.library.pin(deleteTarget!!.id);deleteTarget=null}
   SheetAction(if(deleteTarget!!.id in marks.favorites)"取消收藏"else"收藏对话",if(deleteTarget!!.id in marks.favorites)BridgeIcons.StarFilled else BridgeIcons.Star){repo.library.favorite(deleteTarget!!.id);deleteTarget=null}
+  SheetAction("多选会话",BridgeIcons.Check){startSelection(deleteTarget!!.id)}
   SheetAction("删除对话",BridgeIcons.Delete,danger=true){confirmDelete=deleteTarget;deleteTarget=null}
   Spacer(Modifier.height(12.dp))
  }
+ if(groupTarget!=null)ModalBottomSheet(onDismissRequest={groupTarget=null},containerColor=MaterialTheme.colorScheme.surface){
+  val target=groupTarget!!
+  val group=threads.filter{target.contains(it)}
+  val count=group.count{it.id in unread}
+  Text(target.title,fontSize=16.sp,fontWeight=FontWeight.SemiBold,maxLines=2,overflow=TextOverflow.Ellipsis,modifier=Modifier.padding(horizontal=24.dp,vertical=12.dp))
+  SheetAction("全部标为已读 · $count 个未读",BridgeIcons.Check){repo.readState.markRead(group);groupTarget=null;notify(if(count==0)"没有未读通知"else"已将 $count 个会话标为已读")}
+  Spacer(Modifier.height(12.dp))
+ }
+ if(confirmBatch!=null)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={if(!busy)confirmBatch=null},title={Text("删除 ${confirmBatch!!.size} 个会话？")},text={Text("将删除手机服务中的同步副本，并停止同步这些会话。电脑 Codex 中的原始对话会保留。")},confirmButton={TextButton(enabled=!busy,onClick={val targets=confirmBatch!!;confirmBatch=null;work{repo.deleteThreads(targets){deleted->selectedIds=selectedIds-deleted};finishSelection();notify("已删除 ${targets.size} 个会话")}}){Text("删除",color=MaterialTheme.colorScheme.error)}},dismissButton={TextButton(enabled=!busy,onClick={confirmBatch=null}){Text("取消")}})
  if(newConversation)NewConversationDialog(hosts,threads,projects,busy,{newConversation=false}){host,project->work{val id=repo.createBlank(host,project);newConversation=false;open(id)}}
  if(favorites)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={favorites=false},title={Text("收藏对话")},text={
   val saved=threads.filter{it.id in marks.favorites}.sortedWith(compareByDescending<ThreadRow>{conversationActivity(it)}.thenBy{it.id})
-  if(saved.isEmpty())Text("长按对话可加入收藏")else LazyColumn(Modifier.heightIn(max=420.dp)){items(saved,key={it.id}){thread->Column(Modifier.fillMaxWidth().softCombinedClickable(onClick={favorites=false;open(thread.id)},onLongClick={favorites=false;deleteTarget=thread}).padding(vertical=12.dp)){Text(displayTitle(thread,hosts),maxLines=2,overflow=TextOverflow.Ellipsis);Text("${hosts.find{it.id==thread.hostId}?.let(::hostLabel)?:thread.hostId} · ${threadProjectLabel(thread)}",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
+  if(saved.isEmpty())Text("长按对话可加入收藏")else LazyColumn(Modifier.heightIn(max=420.dp)){items(saved,key={it.id}){thread->Column(Modifier.fillMaxWidth().softCombinedClickable(onClick={favorites=false;open(thread.id)},onLongClick={favorites=false;deleteTarget=thread}).padding(vertical=12.dp)){Text(displayTitle(thread,hosts),maxLines=2,overflow=TextOverflow.Ellipsis);Text("${hosts.find{it.id==thread.groupHostId}?.let(::hostLabel)?:thread.groupHostId} · ${threadProjectLabel(thread)}",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
  },confirmButton={TextButton(onClick={favorites=false}){Text("关闭")}})
  if(confirmDelete!=null)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={confirmDelete=null},title={Text("删除这个对话？")},text={Text("将删除手机服务中的同步副本，并停止同步此对话。电脑 Codex 中的原始对话会保留。")},confirmButton={TextButton(onClick={val target=confirmDelete!!;work{repo.deleteThread(target.id);if(destination==target.id)open(null);confirmDelete=null}}){Text("删除",color=MaterialTheme.colorScheme.error)}},dismissButton={TextButton(onClick={confirmDelete=null}){Text("取消")}})
  if(error!=null&&paired)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={error=null},title={Text("暂时无法完成")},text={Text(error!!)},confirmButton={TextButton(onClick={error=null}){Text("知道了")}})
@@ -196,7 +237,7 @@ private fun displayTitle(thread:ThreadRow,hosts:List<HostRow>):String {
 }
 private fun hostLabel(host:HostRow)=if(host.name.equals("windows",true))"Windows"else host.name
 @OptIn(ExperimentalFoundationApi::class)
-private fun LazyListScope.deviceItems(hosts:List<HostRow>,threads:List<ThreadRow>,collapsed:List<String>,selected:String?,toggle:(String)->Unit,open:(String)->Unit,actions:(ThreadRow)->Unit,unread:Set<String>,marks:ConversationMarks,inDrawer:Boolean,isPinned:(String)->Boolean={false},searching:Boolean=false,pinnedProject:(String)->String?={null},onDeviceHeight:(String,Int)->Unit={_,_->},expanded:Set<String> = emptySet(),toggleExpanded:(String)->Unit={}){
+private fun LazyListScope.deviceItems(hosts:List<HostRow>,threads:List<ThreadRow>,collapsed:List<String>,selected:String?,toggle:(String)->Unit,open:(String)->Unit,actions:(ThreadRow)->Unit,unread:Set<String>,marks:ConversationMarks,inDrawer:Boolean,isPinned:(String)->Boolean={false},searching:Boolean=false,pinnedProject:(String)->String?={null},onDeviceHeight:(String,Int)->Unit={_,_->},expanded:Set<String> = emptySet(),toggleExpanded:(String)->Unit={},groupActions:(ConversationScope)->Unit={},selecting:Boolean=false,selectedIds:Set<String> = emptySet()){
  for((position,device) in deviceGroups(hosts,threads,unread,marks.pinned).map{if(searching)it.copy(preview=it.threads)else it}.filter{!searching||it.threads.isNotEmpty()}.withIndex()){
   if(position>0)item(key="device_gap:${device.host.id}"){Spacer(Modifier.height(6.dp))}
   val host=device.host
@@ -207,14 +248,15 @@ private fun LazyListScope.deviceItems(hosts:List<HostRow>,threads:List<ThreadRow
     val fadeHeight=16.dp.toPx();val fade=Brush.verticalGradient(0f to background,1f to background.copy(alpha=0f),startY=size.height,endY=size.height+fadeHeight)
     onDrawWithContent{drawContent();if(isPinned(host.id))drawRect(fade,topLeft=Offset(0f,size.height),size=Size(size.width,fadeHeight))}
    }){Surface(color=background){Column{
-    Row(Modifier.fillMaxWidth().softClickable{toggle(host.id)}.onSizeChanged{onDeviceHeight(host.id,it.height)}.heightIn(min=48.dp).padding(horizontal=10.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically){
+    Row(Modifier.fillMaxWidth().softCombinedClickable(onClick={toggle(host.id)},onLongClick={if(!selecting)groupActions(ConversationScope(host.id,title=hostLabel(host)))}).onSizeChanged{onDeviceHeight(host.id,it.height)}.heightIn(min=48.dp).padding(horizontal=10.dp,vertical=8.dp),verticalAlignment=Alignment.CenterVertically){
      Icon(BridgeIcons.Computer,null,Modifier.size(20.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.width(10.dp))
      Text(hostLabel(host),fontSize=15.sp,lineHeight=20.sp,fontWeight=FontWeight.SemiBold,modifier=Modifier.weight(1f))
+     if(!host.online)Icon(BridgeIcons.Offline,"设备离线",Modifier.padding(end=8.dp).size(18.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
      if(device.unread)UnreadDot("未读设备 ${host.name}")
      Spacer(Modifier.width(8.dp));Text("${device.threads.size}",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
      BridgeChevron(host.id !in collapsed,if(host.id in collapsed)"展开设备 ${host.name}"else"折叠设备 ${host.name}",Modifier.padding(start=4.dp))
     }
-    if(host.id !in collapsed)projects.find{projectKey(host.id,it.project,it.known)==pinnedProject(host.id)}?.let{project->ProjectHeader(host.id,project,collapsed,toggle,unread,true,if(searching||projectKey(host.id,project.project,project.known) in expanded)project.threads.size else projectPreview(project,unread,marks.pinned).size)}
+    if(host.id !in collapsed)projects.find{projectKey(host.id,it.project,it.known)==pinnedProject(host.id)}?.let{project->ProjectHeader(host.id,project,collapsed,toggle,unread,true,if(selecting||searching||projectKey(host.id,project.project,project.known) in expanded)project.threads.size else projectPreview(project,unread,marks.pinned).size,groupActions=groupActions,selecting=selecting)}
    }}}
   }
   if(host.id !in collapsed){
@@ -222,19 +264,21 @@ private fun LazyListScope.deviceItems(hosts:List<HostRow>,threads:List<ThreadRow
    for(project in projects){
     val projectId=projectKey(host.id,project.project,project.known)
     val preview=projectPreview(project,unread,marks.pinned)
-    val shown=if(searching||projectId in expanded)project.threads else preview
-    item(key=projectId,contentType="project"){ProjectHeader(host.id,project,collapsed,toggle,unread,false,shown.size)}
+    val shown=if(selecting||searching||projectId in expanded)project.threads else preview
+    item(key=projectId,contentType="project"){ProjectHeader(host.id,project,collapsed,toggle,unread,false,shown.size,groupActions=groupActions,selecting=selecting)}
     if(projectId !in collapsed){items(shown,key={it.id},contentType={"conversation"}){thread->
-     Surface(color=if(thread.id==selected)MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent,shape=BridgeShapes.Row,modifier=Modifier.fillMaxWidth().softCombinedClickable(onClick={open(thread.id)},onLongClick={actions(thread)})){
+     Surface(color=if(thread.id==selected||thread.id in selectedIds)MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent,shape=BridgeShapes.Row,modifier=Modifier.fillMaxWidth().softCombinedClickable(onClick={open(thread.id)},onLongClick={if(selecting)open(thread.id)else actions(thread)}).semantics{if(selecting)this.selected=thread.id in selectedIds}){
       Row(Modifier.heightIn(min=48.dp).padding(start=48.dp,end=10.dp,top=6.dp,bottom=6.dp),verticalAlignment=Alignment.CenterVertically){
+       if(selecting){Checkbox(checked=thread.id in selectedIds,onCheckedChange=null,modifier=Modifier.padding(end=8.dp).size(24.dp))}
        Text(displayTitle(thread,hosts),maxLines=2,overflow=TextOverflow.Ellipsis,fontSize=14.sp,lineHeight=19.sp,fontWeight=if(thread.id in unread)FontWeight.Medium else FontWeight.Normal,modifier=Modifier.weight(1f))
+       ConversationTaskStatus(thread,Modifier.padding(start=8.dp))
        if(thread.id in marks.pinned)Icon(BridgeIcons.PinFilled,"已置顶",Modifier.padding(start=6.dp).size(14.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
        if(thread.id in marks.favorites)Icon(BridgeIcons.StarFilled,"已收藏",Modifier.padding(start=6.dp).size(14.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant)
        if(thread.id in unread){Spacer(Modifier.width(8.dp));UnreadDot("未读对话 ${thread.title}")}
       }
      }
     }
-    if(!searching&&preview.size<project.threads.size)item(key="more:$projectId"){
+    if(!selecting&&!searching&&preview.size<project.threads.size)item(key="more:$projectId"){
      val angle by animateFloatAsState(if(projectId in expanded)-90f else 90f,tween(BridgeMotion.Icon),label="project show all")
      Row(Modifier.fillMaxWidth().softClickable{toggleExpanded(projectId)}.heightIn(min=48.dp).padding(start=48.dp,end=10.dp),verticalAlignment=Alignment.CenterVertically){Text(if(projectId in expanded)"收起到最近与未读"else"展开全部 · 另 ${project.threads.size-preview.size} 个对话",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.weight(1f));Icon(BridgeIcons.Chevron,null,Modifier.padding(start=4.dp).size(18.dp).graphicsLayer{rotationZ=angle},tint=MaterialTheme.colorScheme.onSurfaceVariant)}
     }
@@ -243,9 +287,9 @@ private fun LazyListScope.deviceItems(hosts:List<HostRow>,threads:List<ThreadRow
   }
  }
 }
-@Composable private fun ProjectHeader(host:String,project:ProjectGroup,collapsed:List<String>,toggle:(String)->Unit,unread:Set<String>,pinned:Boolean,shown:Int=project.threads.size){
+@Composable private fun ProjectHeader(host:String,project:ProjectGroup,collapsed:List<String>,toggle:(String)->Unit,unread:Set<String>,pinned:Boolean,shown:Int=project.threads.size,groupActions:(ConversationScope)->Unit={},selecting:Boolean=false){
  val id=projectKey(host,project.project,project.known);val label=if(!project.known)"项目待同步"else project.threads.firstOrNull()?.projectName?.takeIf{it.isNotBlank()}?:projectLabel(project.project)
- Row(Modifier.fillMaxWidth().softClickable{toggle(id)}.heightIn(min=48.dp).padding(start=30.dp,end=10.dp,top=6.dp,bottom=6.dp).semantics{if(pinned)contentDescription="固定项目 $label"},verticalAlignment=Alignment.CenterVertically){
+ Row(Modifier.fillMaxWidth().softCombinedClickable(onClick={toggle(id)},onLongClick={if(!selecting)groupActions(ConversationScope(host,project.project,project.known,label))}).heightIn(min=48.dp).padding(start=30.dp,end=10.dp,top=6.dp,bottom=6.dp).semantics{if(pinned)contentDescription="固定项目 $label"},verticalAlignment=Alignment.CenterVertically){
   Icon(BridgeIcons.Folder,null,Modifier.size(18.dp),tint=MaterialTheme.colorScheme.onSurfaceVariant);Spacer(Modifier.width(8.dp));Text(label,fontSize=13.sp,fontWeight=FontWeight.Medium,maxLines=1,overflow=TextOverflow.Ellipsis,modifier=Modifier.weight(1f));if(project.threads.any{it.id in unread})UnreadDot("未读项目 $label");Text(if(shown==project.threads.size)"${project.threads.size}"else"$shown/${project.threads.size}",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(start=8.dp));BridgeChevron(id !in collapsed,if(id in collapsed)"展开项目 $label"else"折叠项目 $label",Modifier.padding(start=4.dp))
  }
 }
@@ -253,12 +297,12 @@ private fun pinnedProjectKey(list:androidx.compose.foundation.lazy.LazyListState
  if(!list.canScrollBackward)return null
  val item=list.layoutInfo.visibleItemsInfo.sortedBy{it.index}.firstOrNull{it.key.toString().let{k->!k.startsWith("device:")&&!k.startsWith("device_gap:")&&!k.startsWith("empty:")}&&it.offset+it.size>deviceHeight}?:return null
  val row=threads.find{it.id==item.key}
- if(row!=null)return if(row.hostId==host)projectKey(host,row.project,row.projectKnown)else null
+ if(row!=null)return if(row.groupHostId==host)projectKey(host,row.project,row.projectKnown)else null
  val key=item.key.toString().removePrefix("more:");return key.takeIf{it.startsWith("project:$host:")&&item.offset<deviceHeight}
 }
 @Composable private fun UnreadDot(description:String){Box(Modifier.size(6.dp).background(Color(0xFF2383E2),CircleShape).semantics{contentDescription=description})}
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ConversationList(hosts:List<HostRow>,threads:List<ThreadRow>,collapsed:List<String>,toggle:(String)->Unit,open:(String)->Unit,delete:(ThreadRow)->Unit,unread:Set<String>,marks:ConversationMarks,refreshing:Boolean,refresh:()->Unit,searching:Boolean=false,expanded:Set<String> = emptySet(),toggleExpanded:(String)->Unit={}){
+@Composable private fun ConversationList(hosts:List<HostRow>,threads:List<ThreadRow>,collapsed:List<String>,toggle:(String)->Unit,open:(String)->Unit,delete:(ThreadRow)->Unit,unread:Set<String>,marks:ConversationMarks,refreshing:Boolean,refresh:()->Unit,searching:Boolean=false,expanded:Set<String> = emptySet(),toggleExpanded:(String)->Unit={},groupActions:(ConversationScope)->Unit={},selecting:Boolean=false,selectedIds:Set<String> = emptySet()){
  val list=rememberLazyListState()
  val deviceHeights=remember{mutableStateMapOf<String,Int>()}
  val deviceHeight=with(androidx.compose.ui.platform.LocalDensity.current){48.dp.roundToPx()}
@@ -271,7 +315,7 @@ private fun pinnedProjectKey(list:androidx.compose.foundation.lazy.LazyListState
  PullToRefreshBox(isRefreshing=refreshing,onRefresh={keepAtStart=true;list.requestScrollToItem(0);refresh()},modifier=Modifier.fillMaxSize()){
  LazyColumn(Modifier.fillMaxSize(),state=list,contentPadding=PaddingValues(start=8.dp,end=8.dp,top=0.dp,bottom=8.dp)){
   if(threads.isEmpty())item{Text(if(searching)"没有匹配的对话"else"点击右上角 ＋ 新建对话",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(horizontal=12.dp,vertical=8.dp))}
-  deviceItems(hosts,threads,collapsed,null,toggle,open,delete,unread,marks,false,isPinned={hostId->list.canScrollBackward&&list.layoutInfo.visibleItemsInfo.any{it.key=="device:$hostId"&&it.offset<=0}},searching=searching,pinnedProject={pinnedProjectKey(list,it,threads,deviceHeights[it]?:deviceHeight)},onDeviceHeight={host,height->deviceHeights[host]=height},expanded=expanded,toggleExpanded=toggleExpanded)
+  deviceItems(hosts,threads,collapsed,null,toggle,open,delete,unread,marks,false,isPinned={hostId->list.canScrollBackward&&list.layoutInfo.visibleItemsInfo.any{it.key=="device:$hostId"&&it.offset<=0}},searching=searching,pinnedProject={pinnedProjectKey(list,it,threads,deviceHeights[it]?:deviceHeight)},onDeviceHeight={host,height->deviceHeights[host]=height},expanded=expanded,toggleExpanded=toggleExpanded,groupActions=groupActions,selecting=selecting,selectedIds=selectedIds)
  }
 }
 }
@@ -296,6 +340,8 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
 @Composable private fun rememberSaveableCompat(initial:String)=androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(initial)}
 @OptIn(ExperimentalLayoutApi::class)
 @Composable private fun ChatScreen(repo:Repository,id:String,thread:ThreadRow?,busy:Boolean,refreshing:Boolean,refresh:()->Unit,header:@Composable ()->Unit,work:((suspend()->Unit))->Unit) {
+ val currentThread by rememberUpdatedState(thread)
+ val currentBusy by rememberUpdatedState(busy)
  var before by remember(id){mutableLongStateOf(Long.MAX_VALUE)};var beforeId by remember(id){mutableStateOf("")}
  var visibleLimit by remember(id){mutableIntStateOf(100)}
  var nextPage by remember(id){mutableStateOf<MessageCursor?>(null)};var loadingHistory by remember(id){mutableStateOf(false)}
@@ -312,22 +358,30 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
  var keyboardWasVisible by remember(id){mutableStateOf(false)}
  LaunchedEffect(keyboardTargetVisible){if(keyboardTargetVisible)keyboardWasVisible=true else if(keyboardWasVisible){focus.clearFocus();keyboardWasVisible=false}}
  BackHandler(composerFocused){focus.clearFocus()}
- val connection by repo.connection.collectAsStateWithLifecycle();val connected=connection.startsWith("已连接")
- val blocked=pending?.status in listOf("submitting","accepted","dispatching","upstream_queued","unknown")
- val captureMode=thread?.status in listOf("queue_ready","capture_only","resume_ready")
+ val connection by repo.connection.collectAsStateWithLifecycle();val connected by remember{derivedStateOf{connection.startsWith("已连接")}}
+ val blocked by remember{derivedStateOf{pending?.status in listOf("submitting","accepted","dispatching","upstream_queued","unknown")}}
+ val captureMode=currentThread?.status in listOf("queue_ready","capture_only","resume_ready")
  val atLatest by remember{derivedStateOf{before==Long.MAX_VALUE&&list.firstVisibleItemIndex==0&&list.firstVisibleItemScrollOffset==0}}
- LaunchedEffect(thread?.updated,thread?.revision,thread?.messageRevision,atLatest,ready){if(ready&&atLatest)thread?.let{repo.readState.markRead(it)}}
+ LaunchedEffect(currentThread?.updated,currentThread?.revision,currentThread?.messageRevision,atLatest,ready){if(ready&&atLatest)currentThread?.let{repo.readState.markRead(it)}}
  fun older(){val cursor=nextPage?:return;if(loadingHistory)return;scope.launch{loadingHistory=true;historyError=false;try{nextPage=repo.loadMessages(id,cursor.ordinal,cursor.id);if(visibleLimit>=5000){before=cursor.ordinal;beforeId=cursor.id;visibleLimit=100}else visibleLimit=minOf(5000,visibleLimit+30)}catch(e:CancellationException){throw e}catch(_:Exception){historyError=true}finally{loadingHistory=false}}}
  // Reposition during the next measure without waiting for a network round trip
  // or animating through every paragraph in a long response.
  fun newest(){val changedWindow=before!=Long.MAX_VALUE;if(changedWindow)visibleLimit=100;before=Long.MAX_VALUE;beforeId="";list.requestScrollToItem(0);if(changedWindow)scope.launch{runCatching{nextPage=repo.loadMessages(id)}}}
  fun loadOlder(){
-  if(loadingHistory||busy||blocked)return
+  if(loadingHistory||currentBusy||blocked)return
   if(nextPage!=null)older()
-  else if(thread?.historyCursor!=null)work{repo.submit(thread,"",true)}
+  else if(currentThread?.historyCursor!=null)work{repo.submit(currentThread!!,"",true)}
   else if(historyError)scope.launch{loadingHistory=true;try{nextPage=repo.loadMessages(id);historyError=false}catch(e:CancellationException){throw e}catch(_:Exception){historyError=true}finally{loadingHistory=false}}
  }
  LaunchedEffect(id){draft=repo.draft(id);draftReady=true;try{nextPage=repo.loadMessages(id)}catch(e:CancellationException){throw e}catch(_:Exception){historyError=true}finally{ready=true}}
+ LaunchedEffect(draftReady,pending?.requestId,pending?.status,currentBusy){
+  val receipt=pending
+  if(draftReady&&!currentBusy&&receipt!=null&&composerSubmitted(receipt.status)){
+   val payload=runCatching{JSONObject(receipt.payload)}.getOrNull()
+   val sent=payload?.optString("text").orEmpty()
+   if(payload?.optString("kind")!="history"&&sent.isNotEmpty()&&draft==sent){draft="";repo.saveDraft(id,"")}
+  }
+ }
  LaunchedEffect(pending?.status){if(pending?.status=="history_loaded"){
   // The computer has inserted records older than our cached range. Fetch
   // from that range's boundary while preserving the current reading position.
@@ -336,30 +390,30 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
   catch(e:CancellationException){throw e}catch(_:Exception){historyError=true}finally{loadingHistory=false}
  }}
  LaunchedEffect(messages.firstOrNull()?.id){if(ready&&atLatest)list.scrollToItem(0)}
-    val pendingText=pending?.takeIf{ConversationPresentation.showPending(it.status)}?.let{runCatching{JSONObject(it.payload).optString("text")}.getOrDefault("")}.orEmpty()
-    val sentAt=pending?.let{runCatching{JSONObject(it.payload).optLong("created_at")*1000}.getOrDefault(0)}?:0
-    val showPendingText=pending!=null&&ConversationPresentation.showPendingText(pending!!.status,pendingText,messages.any{it.role=="user"&&it.text==pendingText&&it.ordinal>=sentAt})
-    val visible=if(showPendingText)listOf(MessageRow(id,"pending:"+pending!!.requestId,"","user",pendingText,"",sentAt,pendingText.length,sentAt))+messages else messages
-    val runs=remember(messages,showPendingText,pending?.requestId,pendingText,sentAt){messageRuns(if(showPendingText)listOf(MessageRow(id,"pending:"+pending!!.requestId,"","user",pendingText,"",sentAt,pendingText.length,sentAt))+messages else messages)}
- ConversationViewport(list=list,header=header,atLatest=atLatest,newest={newest()},refreshing=refreshing,refresh=refresh,loadingOlder=loadingHistory||(blocked&&runCatching{JSONObject(pending!!.payload).optString("kind")=="history"}.getOrDefault(false)),canLoadOlder=ready&&!busy&&!blocked&&(nextPage!=null||thread?.historyCursor!=null||historyError),loadOlder={loadOlder()},composer={
+ val pendingText by remember{derivedStateOf{pending?.takeIf{ConversationPresentation.showPending(it.status)}?.let{runCatching{JSONObject(it.payload).optString("text")}.getOrDefault("")}.orEmpty()}}
+ val sentAt by remember{derivedStateOf{pending?.let{runCatching{JSONObject(it.payload).optLong("created_at")*1000}.getOrDefault(0)}?:0}}
+ val pendingQuestionVisible by remember{derivedStateOf{pending?.let{receipt->messages.any{message->message.role=="question"&&QuestionPresentation.parse(message)?.let{QuestionPresentation.matchesReply(receipt.payload,it.id)}==true}}==true}}
+ val showPendingText by remember{derivedStateOf{!pendingQuestionVisible&&pending!=null&&ConversationPresentation.showPendingText(pending!!.status,pendingText,messages.any{it.role=="user"&&it.text==pendingText&&it.ordinal>=sentAt})}}
+ val runs by remember{derivedStateOf{messageRuns(if(showPendingText)listOf(MessageRow(id,"pending:"+pending!!.requestId,"","user",pendingText,"",sentAt,pendingText.length,sentAt))+messages else messages)}}
+ ConversationViewport(list=list,header=header,atLatest=atLatest,newest={newest()},refreshing=refreshing,refresh=refresh,loadingOlder=loadingHistory||(blocked&&runCatching{JSONObject(pending!!.payload).optString("kind")=="history"}.getOrDefault(false)),canLoadOlder=ready&&!currentBusy&&!blocked&&(nextPage!=null||currentThread?.historyCursor!=null||historyError),loadOlder={loadOlder()},composer={
   Column(Modifier.fillMaxWidth().composerMargins(composerMotion)) {
    Surface(color=MaterialTheme.colorScheme.surface,shape=RoundedCornerShape(26.dp),shadowElevation=2.dp,modifier=Modifier.fillMaxWidth().semantics{testTagsAsResourceId=true}.testTag("conversation_composer")) {
     Box(Modifier.composerBodyFrame(composerMotion)) {
-     BasicTextField(value=draft,onValueChange={value->if(value.toByteArray().size<=32000){draft=value;repo.saveDraft(id,value)}},enabled=draftReady&&!busy,visualTransformation=if(composerFocused)VisualTransformation.None else CompactDraftTransformation,maxLines=if(composerFocused)6 else 1,textStyle=TextStyle(color=MaterialTheme.colorScheme.onSurface,fontSize=16.sp,lineHeight=24.sp),cursorBrush=SolidColor(MaterialTheme.colorScheme.onSurface),modifier=Modifier.align(Alignment.TopStart).fillMaxWidth().padding(end=48.dp).heightIn(min=48.dp).onFocusChanged{composerFocused=it.isFocused},decorationBox={inner->Box(contentAlignment=Alignment.CenterStart){if(draft.isEmpty())Text("发送消息",fontSize=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);inner()}})
+     BasicTextField(value=draft,onValueChange={value->if(value.toByteArray().size<=32000){draft=value;repo.saveDraft(id,value)}},enabled=draftReady&&!currentBusy,visualTransformation=if(composerFocused)VisualTransformation.None else CompactDraftTransformation,maxLines=if(composerFocused)6 else 1,textStyle=TextStyle(color=MaterialTheme.colorScheme.onSurface,fontSize=16.sp,lineHeight=24.sp),cursorBrush=SolidColor(MaterialTheme.colorScheme.onSurface),modifier=Modifier.align(Alignment.TopStart).fillMaxWidth().padding(end=48.dp).heightIn(min=48.dp).onFocusChanged{composerFocused=it.isFocused},decorationBox={inner->Box(contentAlignment=Alignment.CenterStart){if(draft.isEmpty())Text("发送消息",fontSize=16.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);inner()}})
      CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 0.dp) {
-     BridgeIconButton(enabled=!busy&&connected&&!blocked&&thread?.canSend==true&&thread.online&&draft.isNotBlank(),onClick={focus.clearFocus();newest();work{val sent=draft;val result=repo.submit(thread!!,sent);if(result.status in listOf("accepted","dispatching","upstream_queued","codex_accepted")&&draft==sent)draft=""}},modifier=Modifier.align(Alignment.BottomEnd),filled=true){Icon(BridgeIcons.Up,"发送",Modifier.size(20.dp))}
+     BridgeIconButton(enabled=!currentBusy&&connected&&!blocked&&currentThread?.canSend==true&&currentThread?.online==true&&draft.isNotBlank(),onClick={focus.clearFocus();newest();work{val sent=draft;val result=repo.submit(currentThread!!,sent);if(composerSubmitted(result.status)&&draft==sent){draft="";repo.saveDraft(id,"")}}},modifier=Modifier.align(Alignment.BottomEnd),filled=true){Icon(BridgeIcons.Up,"发送",Modifier.size(20.dp))}
      }
     }
    }
 
   }
  },composerMotion=composerMotion,loading=messages.isEmpty()&&!ready) {
-    if(pending!=null&&ConversationPresentation.showPending(pending!!.status))item(key="pending:${pending!!.requestId}"){
+    if(!pendingQuestionVisible&&pending!=null&&ConversationPresentation.showPending(pending!!.status))item(key="pending:${pending!!.requestId}"){
      val text=runCatching{JSONObject(pending!!.payload).optString("text")}.getOrDefault("")
      PendingMessage(pending!!,captureMode,false,text,work,repo)
     }
     items(runs,key={it.key},contentType={it.role}){run->MessageRunCard(repo,run,list,work)}
-    if(messages.isEmpty()&&ready)item{Column(Modifier.fillMaxWidth().padding(vertical=100.dp),horizontalAlignment=Alignment.CenterHorizontally){Text(if(thread?.localOnly==true)"开始新对话"else"从这里继续",fontSize=22.sp,fontWeight=FontWeight.SemiBold);Text(if(thread?.localOnly==true)"${threadProjectLabel(thread)} · 发送第一条消息开始"else"电脑保存的消息会显示在此对话中",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=12.dp))}}
+    if(messages.isEmpty()&&ready)item{Column(Modifier.fillMaxWidth().padding(vertical=100.dp),horizontalAlignment=Alignment.CenterHorizontally){Text(if(currentThread?.localOnly==true)"开始新对话"else"从这里继续",fontSize=22.sp,fontWeight=FontWeight.SemiBold);Text(if(currentThread?.localOnly==true)"${threadProjectLabel(currentThread!!)} · 发送第一条消息开始"else"电脑保存的消息会显示在此对话中",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=12.dp))}}
     if(historyError)item(key="history_error"){Text("历史加载失败，拉动顶部可重试",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.fillMaxWidth())}
 
  }
@@ -367,7 +421,7 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
 
 @Composable private fun PendingMessage(pending:Pending,captureMode:Boolean,showText:Boolean,text:String,work:((suspend()->Unit))->Unit,repo:Repository) {
  Column(Modifier.fillMaxWidth(),horizontalAlignment=Alignment.End) {
-  if(showText){UserBubble(text);Text(messageTimestamp(runCatching{JSONObject(pending.payload).optLong("created_at")*1000}.getOrDefault(0)),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}
+  if(showText){UserBubble(QuestionPresentation.visibleReply(text));Text(messageTimestamp(runCatching{JSONObject(pending.payload).optLong("created_at")*1000}.getOrDefault(0)),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}
   Text(ReceiptPresentation.label(pending.status,captureMode),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp))
   pending.error?.let{Text(ReceiptPresentation.errorLabel(it),fontSize=12.sp,lineHeight=18.sp,color=MaterialTheme.colorScheme.error,modifier=Modifier.padding(top=4.dp))}
   if(pending.status=="accepted")TextButton(onClick={work{repo.cancel(pending)}}){Text("取消发送",fontSize=12.sp)}
@@ -382,7 +436,7 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
 @Composable private fun MessageCard(repo:Repository,message:MessageRow,work:((suspend()->Unit))->Unit) {
  var offset by remember(message.id,message.version){mutableIntStateOf(0)};var text by remember(message.id,message.version){mutableStateOf(message.text)}
  Column(Modifier.fillMaxWidth(),horizontalAlignment=if(message.role=="user")Alignment.End else Alignment.Start) {
-  if(message.role=="user")UserMessageWithImages(repo,message,text){UserBubble(it)}else MessageBody(text)
+  if(message.role=="question")QuestionCard(repo,message,work)else if(message.role=="user")UserMessageWithImages(repo,message,QuestionPresentation.visibleReply(text)){UserBubble(it)}else MessageBody(text)
   if(message.characters>16000) {
    Row(Modifier.fillMaxWidth().padding(top=12.dp),verticalAlignment=Alignment.CenterVertically){TextButton(enabled=offset>0,onClick={work{val next=maxOf(0,offset-16000);text=repo.chunk(message,next);offset=next}}){Text("上一段",fontSize=12.sp)};Text("${offset+1}–${minOf(offset+16000,message.characters)} / ${message.characters}",fontSize=11.sp,color=MaterialTheme.colorScheme.onSurfaceVariant);TextButton(enabled=offset+16000<message.characters,onClick={work{val next=offset+16000;text=repo.chunk(message,next);offset=next}}){Text("下一段",fontSize=12.sp)}}
   }

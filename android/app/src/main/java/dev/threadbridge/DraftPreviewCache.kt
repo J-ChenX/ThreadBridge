@@ -9,3 +9,6 @@ internal class DraftPreviewCache {
  fun committed(id:String,generation:Long,text:String){pending.remove(id,Entry(generation,text))}
  fun clear(){pending.clear()}
 }
+
+/** Called within one generation; preserve final order across local-ID redirects. */
+internal fun latestDrafts(writes:List<Draft>)=writes.asReversed().distinctBy{it.threadId}.asReversed()

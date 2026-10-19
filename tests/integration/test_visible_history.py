@@ -29,6 +29,9 @@ def main():
         host = json.loads((root/'agent.json').read_text())['host_id']
         native, turn, live = [str(uuid.uuid4()) for _ in range(3)]
         png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jC1sAAAAASUVORK5CYII=')
+        # A native photo can exceed the old 2 MiB attachment and 4 MiB JSONL
+        # limits. Verify exact bytes survive capture, Hub import and phone API.
+        png += b'\0' * (3 * 1024 * 1024)
         image = hashlib.sha256(png).hexdigest()
         def item(payload, stamp='1970-01-01T00:01:40.000Z'):
             return {'type':'response_item', 'timestamp':stamp, 'payload':payload}
@@ -119,13 +122,48 @@ def main():
             assert c.execute("SELECT body FROM messages WHERE id=?",('notify:'+older,)).fetchone()[0]=='较早回复'
         with sqlite3.connect(capture) as c:
             assert c.execute('SELECT captured_at FROM captured_replies WHERE turn_id=?',(older,)).fetchone()[0]==91
+        # Saved replicas can outlive an index entry (e.g. removed native history).
+        # Continuous sync must retain that replica without a permanent false alarm.
+        with sqlite3.connect(index) as c:c.execute('DELETE FROM threads WHERE id=?',(native,))
+        sync=subprocess.Popen([binary,'capture-sync','--db',hub,'--capture-db',capture,'--host',host,'--all-captured','--native-index',index],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            deadline=time.monotonic()+8
+            while True:
+                with sqlite3.connect(hub) as c:health=c.execute('SELECT status FROM capture_health WHERE host=?',(host,)).fetchone()
+                if health:
+                    assert 'projection_error' not in json.loads(health[0]),health
+                    break
+                assert sync.poll() is None and time.monotonic()<deadline,'capture sync failed to publish health'
+                time.sleep(.1)
+            with sqlite3.connect(hub) as c:assert c.execute('SELECT count(*) FROM messages').fetchone()[0]>0
+        finally:sync.terminate();sync.wait(timeout=3)
+        with sqlite3.connect(index) as c:c.execute('INSERT INTO threads VALUES(?,?,?,0)',(native,str(rollout),'user'))
+        # A still-indexed but unreadable rollout is a real fault and must remain
+        # visible, then clear itself after the source recovers.
+        parked=rollout.with_suffix('.parked')
+        rollout.rename(parked)
+        sync=subprocess.Popen([binary,'capture-sync','--db',hub,'--capture-db',capture,'--host',host,'--all-captured','--native-index',index],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        try:
+            def await_projection(expected):
+                deadline=time.monotonic()+8
+                while True:
+                    with sqlite3.connect(hub) as c:row=c.execute('SELECT status FROM capture_health WHERE host=?',(host,)).fetchone()
+                    if row and ('projection_error' in json.loads(row[0]))==expected:return
+                    assert sync.poll() is None and time.monotonic()<deadline,'projection health did not converge'
+                    time.sleep(.1)
+            await_projection(True)
+            parked.rename(rollout)
+            await_projection(False)
+        finally:
+            sync.terminate();sync.wait(timeout=3)
+            if parked.exists():parked.rename(rollout)
         args=['cleanup-archived','--db',hub,'--capture-db',capture,'--index',index,'--host',host,'--apply','--backup-dir',root/'backup']
         with sqlite3.connect(index) as c:c.execute('UPDATE threads SET archived=1')
         Path(str(capture)+'.collection.json').write_text(json.dumps({'schema':1,'generation':str(uuid.uuid4()),'cutoff_ms':1,'excluded':[]}))
         run(*args)
         for database,table in [(capture,'captured_images'),(capture,'captured_visible_messages'),(hub,'attachments'),(hub,'thread_message_state')]:
             with sqlite3.connect(database) as c:assert c.execute(f'SELECT count(*) FROM {table}').fetchone()[0]==0
-        print('visible history: photos, repeated human text, live commentary, ordered canonical finals, replay, auth and cleanup pass; tools and reasoning excluded')
+        print('visible history: photos, repeated human text, live commentary, ordered canonical finals, replay, auth and cleanup pass; missing index history retained, actual source faults visible and recovery clears health; tools and reasoning excluded')
 
 
 if __name__=='__main__':main()

@@ -67,10 +67,14 @@ pub fn binding(database: &Path) -> Result<String> {
     let db = native_remote::readonly(database)?;
     db.execute_batch("BEGIN")?;
     let mut used = 0u64;
-    for table in TABLES
-        .into_iter()
-        .chain(["captured_images", "captured_visible_messages"])
-    {
+    for table in TABLES.into_iter().chain([
+        "captured_images",
+        "captured_assistant_images",
+        "captured_visible_messages",
+        "captured_questions",
+        "captured_task_state",
+        "captured_thread_titles",
+    ]) {
         if !db.query_row(
             "SELECT count(*)>0 FROM sqlite_master WHERE type='table' AND name=?1",
             [table],
@@ -317,9 +321,10 @@ pub fn batch_limits(
                     "partial_turn_records_unconfirmed"
                 );
             }
-            let size = fs::metadata(&path)?.len();
-            let cost = size
-                .min(TAIL_BYTES)
+            let mut history = crate::rollout::Source::open(&path, total_scan)?;
+            let size = history.len();
+            let cost = history
+                .scan_cost(TAIL_BYTES)
                 .saturating_add(size.saturating_mul(rows.len() as u64));
             ensure!(cost <= total_scan, "source_revalidation_budget");
             if cost > budget {
@@ -327,8 +332,13 @@ pub fn batch_limits(
                 return Ok(());
             }
             budget -= cost;
-            let (events, _) =
-                native_remote::completed_events(&path, native, &config.codex_home, TAIL_BYTES)?;
+            let (events, _) = native_remote::completed_source(
+                &path,
+                native,
+                &config.codex_home,
+                TAIL_BYTES,
+                Some(&mut history),
+            )?;
             ensure!(
                 !events.is_empty() && events.last().unwrap().1["turn-id"] == old["turn_id"],
                 "completion_chain_unconfirmed"
@@ -396,7 +406,9 @@ pub fn batch_limits(
                 native_remote::fingerprint(&path)? == before,
                 "source_changed_during_revalidation"
             );
-            proof = Some(json!({"path":path,"resolved":path.canonicalize()?,"fingerprint":before}));
+            proof = Some(
+                json!({"path":path,"resolved":crate::rollout::resolve(&path)?.canonicalize()?,"fingerprint":before}),
+            );
             Ok(())
         })();
         if deferred {
@@ -476,7 +488,7 @@ pub fn finalize(database: &Path, directory: &Path) -> Result<Value> {
     {
         let path = Path::new(proof["path"].as_str().context("proof_path_invalid")?);
         ensure!(
-            json!(path.canonicalize()?) == proof["resolved"]
+            json!(crate::rollout::resolve(path)?.canonicalize()?) == proof["resolved"]
                 && native_remote::fingerprint(path)? == proof["fingerprint"],
             "recovery_source_changed"
         );
@@ -489,7 +501,7 @@ pub fn finalize(database: &Path, directory: &Path) -> Result<Value> {
     )
 }
 pub async fn run(args: RecoveryArgs) -> Result<()> {
-    let config: RemoteConfig = serde_json::from_slice(&fs::read(args.config)?)?;
+    let config = native_remote::load_config(&args.config)?;
     let result = match args.action {
         RecoveryAction::Prepare { identifier } => {
             json!({"directory":prepare(&config,&args.database,&identifier.unwrap_or_else(||Uuid::new_v4().to_string()))?})

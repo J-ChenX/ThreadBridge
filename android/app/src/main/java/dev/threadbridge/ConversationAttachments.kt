@@ -29,7 +29,7 @@ object ConversationAttachments {
 }
 
 @Composable private fun UserImage(repo:Repository,message:MessageRow,id:String) {
- var bitmap by remember(message.threadId,id){mutableStateOf<Bitmap?>(null)}
+ var bitmap by remember(message.threadId,id){mutableStateOf(repo.cachedUserImage(message,id))}
  var failed by remember{mutableStateOf(false)}
  var attempt by remember{mutableIntStateOf(0)}
  var expanded by remember{mutableStateOf(false)}

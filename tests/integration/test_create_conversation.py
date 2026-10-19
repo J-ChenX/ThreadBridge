@@ -7,7 +7,7 @@ from test_conversation_sync import save_turn
 def main():
  binary=Path(sys.argv[1]).resolve();repo=Path(__file__).resolve().parents[2]
  with tempfile.TemporaryDirectory(prefix='tb-create-') as tmp:
-  root=Path(tmp);db=root/'hub.sqlite';source=root/'capture.sqlite';fake=root/'codex';fake.symlink_to(repo/'tests/fixtures/mock_codex.py');native='00000000-0000-4000-8000-000000000001';root.joinpath('fixture.json').write_text(json.dumps({'mode':'create','native_id':native,'reply':False,'queue_error':True}))
+  root=Path(tmp);db=root/'hub.sqlite';source=root/'capture.sqlite';fake=root/'codex';fake.symlink_to(repo/'tests/fixtures/mock_codex.py');native='00000000-0000-4000-8000-000000000001';root.joinpath('fixture.json').write_text(json.dumps({'mode':'create','native_id':native,'reply':False,'queue_error':True,'no_socket':True}))
   env={'PATH':'/usr/bin:/bin','HOME':str(root),'CODEX_HOME':str(root)}
   baseline='00000000-0000-4000-8000-000000000002';turn='00000000-0000-4000-8000-000000000003'
   event={'thread-id':baseline,'turn-id':turn,'type':'agent-turn-complete','last-assistant-message':'baseline','cwd':str(root)}
@@ -40,7 +40,7 @@ def main():
    receipt=wait(lambda:(lambda r:r if r['status']=='unknown' else None)(api('/v1/commands/'+command['id'])))
    tid=hashlib.sha256(('host\0default\0'+native).encode()).hexdigest();assert receipt['result_thread_id']==tid
    row=next(r for r in api('/v1/threads')['threads'] if r['id']==tid);assert row['native_id']==native and row['project']==str(root)
-   assert root.joinpath('calls').read_text()=='start\nqueue\n'
+   assert root.joinpath('calls').read_text()=='start\nname\nqueue\n'
    final_turn='00000000-0000-4000-8000-000000000009';stamp=int(time.time()*1000)+1
    save_turn(source,native,final_turn,[('new-human','phone starts here',stamp,hashlib.sha256(b'phone starts here').hexdigest())],stamp+1)
    completed={'thread-id':native,'turn-id':final_turn,'type':'agent-turn-complete','last-assistant-message':'first created reply','cwd':str(root)}
@@ -48,7 +48,7 @@ def main():
    wait(lambda:api('/v1/commands/'+command['id'])['status']=='codex_accepted')
    assert [m['role'] for m in reversed(api('/v1/threads/'+tid+'/messages')['messages'])]==['user','assistant']
    worker.terminate();worker.wait(timeout=3);worker=bridge();time.sleep(2.2)
-   assert root.joinpath('calls').read_text()=='start\nqueue\n';assert api('/v1/commands/'+payload['request_id'])['result_thread_id']==tid
+   assert root.joinpath('calls').read_text()=='start\nname\nqueue\n';assert api('/v1/commands/'+payload['request_id'])['result_thread_id']==tid
    assert api('/v1/threads?q=phone%20here')['threads'][0]['id']==tid
    print('PASS real Hub -> durable creation -> bridge -> isolated mock thread/start and queue; project, native ID adoption after queue execution error, search, first-turn completion and restart no resend')
   finally:

@@ -17,10 +17,15 @@ pub const CAPTURE_TABLES: &[&str] = &[
     "captured_user_messages",
     "captured_turn_order",
     "captured_visible_messages",
+    "captured_questions",
     "captured_images",
+    "captured_assistant_images",
     "captured_projects",
+    "captured_task_state",
+    "captured_thread_titles",
 ];
 pub const HUB_TABLES: &[&str] = &[
+    "desktop_thread_origins",
     "threads",
     "messages",
     "events",
@@ -36,6 +41,7 @@ pub const HUB_TABLES: &[&str] = &[
     "thread_message_state",
     "resume_owners",
     "thread_projects",
+    "thread_tasks",
     "creation_results",
     "creation_hosts",
 ];

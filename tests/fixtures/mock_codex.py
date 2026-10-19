@@ -27,12 +27,17 @@ if config["mode"] == "create":
         else:
             print("uncertain")
         sys.exit(0)
-    assert sys.argv[1:] == ["app-server", "proxy"]
+    if sys.argv[1:] == ["app-server", "proxy"] and config.get("no_socket", False):
+        sys.exit(1)
+    assert sys.argv[1:] == (["app-server", "--stdio"] if config.get("no_socket", False) else ["app-server", "proxy"])
     for line in sys.stdin:
         request = json.loads(line)
         if "id" not in request:
             continue
         if request["method"] == "initialize":
+            if config.get("fail_initialize", False):
+                print(json.dumps({"id": request["id"], "error": {"code": -32603, "message": "fixture unavailable"}}), flush=True)
+                continue
             result = {}
         elif request["method"] == "thread/start":
             assert request["params"] == {"cwd": str(fixture_dir)}
@@ -41,6 +46,13 @@ if config["mode"] == "create":
             if config.get("lose_start", False):
                 sys.exit(0)
             result = {"thread": {"id": config["native_id"]}}
+        elif request["method"] == "thread/name/set":
+            assert request["params"] == {"threadId": config["native_id"], "name": "phone starts here"}
+            with (fixture_dir / "calls").open("a") as calls:
+                calls.write("name\n")
+            if config.get("lose_name", False):
+                sys.exit(0)
+            result = {}
         else:
             raise RuntimeError("unexpected creation method")
         print(json.dumps({"id": request["id"], "result": result}), flush=True)
