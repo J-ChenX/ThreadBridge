@@ -41,6 +41,7 @@ fn bad(e: anyhow::Error) -> ApiError {
         "restore_read_only",
         "host_offline",
         "not_ready",
+        "steer_not_ready",
         "revision_conflict",
         "queue_full",
         "thread_command_pending",
@@ -77,6 +78,12 @@ async fn create_thread(
 ) -> ApiResult {
     let device = auth(&h, &s, "phone")?;
     s.db.submit_new(&device, &p).map(Json).map_err(bad)
+}
+async fn steer(State(s): State<Hub>, h: HeaderMap, Path(id): Path<String>) -> ApiResult {
+    let device = auth(&h, &s, "phone")?;
+    crate::steering::submit(&s.db, &device, &id)
+        .map(Json)
+        .map_err(bad)
 }
 async fn pair(State(s): State<Hub>, Json(p): Json<Pair>) -> ApiResult {
     let mut rate = s.pair_rate.lock().unwrap();
@@ -313,6 +320,7 @@ pub async fn run(db: Store, listen: &str) -> anyhow::Result<()> {
         .route("/v1/commands", post(submit))
         .route("/v1/commands/{id}", get(command))
         .route("/v1/commands/{id}/cancel", post(cancel))
+        .route("/v1/commands/{id}/steer", post(steer))
         .route("/v1/events", get(events))
         .route("/v1/events/ws", get(event_socket))
         .route("/v1/agent/ws", get(agent_socket))

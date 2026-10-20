@@ -104,6 +104,7 @@ private fun stateLabel(status:String)=when(status) {
  // fresh parameters instead of retaining the initial captured list/read state.
  val threads by rememberUpdatedState(threadFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
  val hosts by rememberUpdatedState(hostFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
+ val creationProjects by rememberUpdatedState(repo.creationProjects.collectAsStateWithLifecycle().value)
  val projects by rememberUpdatedState(projectFlow.collectAsStateWithLifecycle(initialValue=emptyList()).value)
  val epoch by rememberUpdatedState(repo.collection.collectAsStateWithLifecycle().value)
  val unread by rememberUpdatedState(repo.readState.unread.collectAsStateWithLifecycle().value)
@@ -221,7 +222,7 @@ private fun stateLabel(status:String)=when(status) {
   Spacer(Modifier.height(12.dp))
  }
  if(confirmBatch!=null)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={if(!busy)confirmBatch=null},title={Text("删除 ${confirmBatch!!.size} 个会话？")},text={Text("将删除手机服务中的同步副本，并停止同步这些会话。电脑 Codex 中的原始对话会保留。")},confirmButton={TextButton(enabled=!busy,onClick={val targets=confirmBatch!!;confirmBatch=null;work{repo.deleteThreads(targets){deleted->selectedIds=selectedIds-deleted};finishSelection();notify("已删除 ${targets.size} 个会话")}}){Text("删除",color=MaterialTheme.colorScheme.error)}},dismissButton={TextButton(enabled=!busy,onClick={confirmBatch=null}){Text("取消")}})
- if(newConversation)NewConversationDialog(hosts,threads,projects,busy,{newConversation=false}){host,project->work{val id=repo.createBlank(host,project);newConversation=false;open(id)}}
+ if(newConversation)NewConversationDialog(hosts,threads,projects,creationProjects,busy,{newConversation=false}){host,project->work{val id=repo.createBlank(host,project);newConversation=false;open(id)}}
  if(favorites)AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={favorites=false},title={Text("收藏对话")},text={
   val saved=threads.filter{it.id in marks.favorites}.sortedWith(compareByDescending<ThreadRow>{conversationActivity(it)}.thenBy{it.id})
   if(saved.isEmpty())Text("长按对话可加入收藏")else LazyColumn(Modifier.heightIn(max=420.dp)){items(saved,key={it.id}){thread->Column(Modifier.fillMaxWidth().softCombinedClickable(onClick={favorites=false;open(thread.id)},onLongClick={favorites=false;deleteTarget=thread}).padding(vertical=12.dp)){Text(displayTitle(thread,hosts),maxLines=2,overflow=TextOverflow.Ellipsis);Text("${hosts.find{it.id==thread.groupHostId}?.let(::hostLabel)?:thread.groupHostId} · ${threadProjectLabel(thread)}",fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)}}}
@@ -410,7 +411,7 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
  },composerMotion=composerMotion,loading=messages.isEmpty()&&!ready) {
     if(!pendingQuestionVisible&&pending!=null&&ConversationPresentation.showPending(pending!!.status))item(key="pending:${pending!!.requestId}"){
      val text=runCatching{JSONObject(pending!!.payload).optString("text")}.getOrDefault("")
-     PendingMessage(pending!!,captureMode,false,text,work,repo)
+     PendingMessage(pending!!,captureMode,false,text,work,repo,taskIsRunning(currentThread)&&!currentBusy&&connected)
     }
     items(runs,key={it.key},contentType={it.role}){run->MessageRunCard(repo,run,list,work)}
     if(messages.isEmpty()&&ready)item{Column(Modifier.fillMaxWidth().padding(vertical=100.dp),horizontalAlignment=Alignment.CenterHorizontally){Text(if(currentThread?.localOnly==true)"开始新对话"else"从这里继续",fontSize=22.sp,fontWeight=FontWeight.SemiBold);Text(if(currentThread?.localOnly==true)"${threadProjectLabel(currentThread!!)} · 发送第一条消息开始"else"电脑保存的消息会显示在此对话中",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=12.dp))}}
@@ -419,11 +420,12 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
  }
 }
 
-@Composable private fun PendingMessage(pending:Pending,captureMode:Boolean,showText:Boolean,text:String,work:((suspend()->Unit))->Unit,repo:Repository) {
+@Composable private fun PendingMessage(pending:Pending,captureMode:Boolean,showText:Boolean,text:String,work:((suspend()->Unit))->Unit,repo:Repository,canSteer:Boolean=false) {
  Column(Modifier.fillMaxWidth(),horizontalAlignment=Alignment.End) {
   if(showText){UserBubble(QuestionPresentation.visibleReply(text));Text(messageTimestamp(runCatching{JSONObject(pending.payload).optLong("created_at")*1000}.getOrDefault(0)),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=4.dp))}
   Text(ReceiptPresentation.label(pending.status,captureMode),fontSize=12.sp,color=MaterialTheme.colorScheme.onSurfaceVariant,modifier=Modifier.padding(top=8.dp))
   pending.error?.let{Text(ReceiptPresentation.errorLabel(it),fontSize=12.sp,lineHeight=18.sp,color=MaterialTheme.colorScheme.error,modifier=Modifier.padding(top=4.dp))}
+  if(canSteerPending(pending.status,pending.error,canSteer))TextButton(onClick={work{repo.steerPending(pending)}}){Text("作为引导发送",fontSize=12.sp)}
   if(pending.status=="accepted")TextButton(onClick={work{repo.cancel(pending)}}){Text("取消发送",fontSize=12.sp)}
   if(pending.status=="submitting")TextButton(onClick={work{repo.retryPending(pending)}}){Text("查询发送结果",fontSize=12.sp)}
  }
@@ -443,28 +445,31 @@ private val CompactDraftTransformation=VisualTransformation { text->TransformedT
  }
 }
 
-@Composable private fun NewConversationDialog(hosts:List<HostRow>,threads:List<ThreadRow>,catalog:List<ProjectRow>,busy:Boolean,dismiss:()->Unit,create:(HostRow,String)->Unit){
+@Composable private fun NewConversationDialog(hosts:List<HostRow>,threads:List<ThreadRow>,catalog:List<ProjectRow>,remote:List<NewConversationProject>,busy:Boolean,dismiss:()->Unit,create:(HostRow,NewConversationProject)->Unit){
  var hostId by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf(hosts.firstOrNull()?.id.orEmpty())}
- var project by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf("")}
+ var projectKey by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf("")}
  var choosing by androidx.compose.runtime.saveable.rememberSaveable{mutableStateOf("")}
  val host=hosts.find{it.id==hostId}
- val paths=remember(hostId,threads,catalog){(catalog.filter{it.hostId==hostId}.map{it.path}+threads.filter{it.hostId==hostId&&it.projectKnown}.map{it.project}+"").distinct().sortedBy{if(it.isEmpty())"\uffff"else it}}
- fun label(path:String)=catalog.find{it.hostId==hostId&&it.path==path}?.name?.takeIf{it.isNotBlank()}?:threads.find{it.hostId==hostId&&it.project==path}?.projectName?.takeIf{it.isNotBlank()}?:projectLabel(path)
+ val paths=remember(hostId,threads,catalog,remote){newConversationProjects(hostId,catalog,remote,threads)}
+ val project=paths.find{it.key==projectKey}?:paths.find{it.path.isEmpty()&&it.hostId==hostId}
+ val executor=hosts.find{it.id==project?.hostId}
+ fun label(destination:NewConversationProject?)=destination?.let{it.name.takeIf{n->n.isNotBlank()}?:projectLabel(it.path)}?:"其他"
+ fun detail(destination:NewConversationProject)=if(destination.path.isEmpty())"未归属项目"else if(destination.hostId!=hostId)"${hosts.find{it.id==destination.hostId}?.let(::hostLabel)?:"远端设备"} · ${destination.path}"else destination.path
  AlertDialog(shape=BridgeShapes.Panel,onDismissRequest={if(!busy)dismiss()},title={Row(verticalAlignment=Alignment.CenterVertically){if(choosing.isNotEmpty())BridgeIconButton(onClick={choosing=""}){Icon(BridgeIcons.Back,"返回新建对话")};Text(when(choosing){"device"->"选择设备";"project"->"选择项目";else->"新建对话"},fontSize=20.sp)}},text={
   AnimatedContent(targetState=choosing,transitionSpec={
    (fadeIn(tween(BridgeMotion.Fade))+slideInHorizontally(tween(BridgeMotion.Icon)){if(targetState.isEmpty())-16 else 16}) togetherWith
     (fadeOut(tween(BridgeMotion.Press))+slideOutHorizontally(tween(BridgeMotion.Icon)){if(targetState.isEmpty())16 else -16}) using SizeTransform(clip=true,sizeAnimationSpec={_,_->tween(BridgeMotion.Icon,easing=FastOutSlowInEasing)})
   },label="new conversation choice"){page->
    if(page.isNotEmpty())LazyColumn(Modifier.fillMaxWidth().heightIn(max=360.dp)){
-    if(page=="device")items(hosts,key={it.id}){device->SelectionOption(hostLabel(device),if(device.online)"已连接"else"离线",device.id==hostId,BridgeIcons.Computer){hostId=device.id;project="";choosing=""}}
-    else items(paths,key={it}){path->SelectionOption(label(path),if(path.isEmpty())"未归属项目"else path,path==project,BridgeIcons.Folder){project=path;choosing=""}}
+    if(page=="device")items(hosts,key={it.id}){device->SelectionOption(hostLabel(device),if(device.online)"已连接"else"离线",device.id==hostId,BridgeIcons.Computer){hostId=device.id;projectKey="";choosing=""}}
+    else items(paths,key={it.key}){path->SelectionOption(label(path),detail(path),path==project,BridgeIcons.Folder){projectKey=path.key;choosing=""}}
    }else Column(verticalArrangement=Arrangement.spacedBy(12.dp)){
     SelectionField("设备",host?.let(::hostLabel)?:"暂无设备",BridgeIcons.Computer,!busy&&hosts.isNotEmpty()){choosing="device"}
     SelectionField("项目",label(project),BridgeIcons.Folder,!busy&&host!=null){choosing="project"}
-    Text("选择设备与项目，开始新的对话。",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
+    Text(if(project!=null&&project.hostId!=hostId)"将在 ${executor?.let(::hostLabel)?:"远端设备"} 上创建对话。"else"选择设备与项目，开始新的对话。",fontSize=13.sp,color=MaterialTheme.colorScheme.onSurfaceVariant)
    }
   }
- },confirmButton={if(choosing.isEmpty())TextButton(enabled=host!=null&&!busy,onClick={host?.let{create(it,project)}}){Text("建立")}},dismissButton={if(choosing.isEmpty())TextButton(enabled=!busy,onClick=dismiss){Text("取消")}})
+ },confirmButton={if(choosing.isEmpty())TextButton(enabled=executor!=null&&project!=null&&!busy,onClick={if(executor!=null&&project!=null)create(executor,project)}){Text("建立")}},dismissButton={if(choosing.isEmpty())TextButton(enabled=!busy,onClick=dismiss){Text("取消")}})
 }
 @Composable private fun SelectionField(label:String,value:String,icon:androidx.compose.ui.graphics.vector.ImageVector,enabled:Boolean,select:()->Unit){
  Surface(color=MaterialTheme.colorScheme.surfaceContainerHigh,shape=RoundedCornerShape(16.dp),modifier=Modifier.fillMaxWidth().softClickable(enabled=enabled,onClick=select)){

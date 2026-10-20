@@ -52,7 +52,7 @@ data class MessageRow(val threadId:String,val id:String,val turnId:String,val ro
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putDraft(row:Draft)
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putPending(row:Pending)
  @Query("SELECT * FROM pending WHERE threadId=:id ORDER BY rowid DESC LIMIT 1") fun pending(id:String):Flow<Pending?>
- @Query("SELECT * FROM pending WHERE status IN ('submitting','accepted','dispatching','upstream_queued','unknown') LIMIT 128") suspend fun unresolved():List<Pending>
+ @Query("SELECT * FROM pending WHERE status IN ('submitting','accepted','dispatching','upstream_queued','unknown','steer_accepted') LIMIT 128") suspend fun unresolved():List<Pending>
  @Query("SELECT p.* FROM pending p JOIN threads t ON p.threadId=t.id WHERE t.localOnly=1 LIMIT 128") suspend fun localCreations():List<Pending>
  @Query("SELECT * FROM pending WHERE requestId=:id") suspend fun pendingById(id:String):Pending?
  @Insert(onConflict=OnConflictStrategy.REPLACE) suspend fun putSync(row:SyncState)

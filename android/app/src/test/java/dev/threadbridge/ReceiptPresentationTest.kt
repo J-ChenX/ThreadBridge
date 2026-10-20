@@ -9,4 +9,10 @@ class ReceiptPresentationTest {
  @Test fun approvalAndMissingToolsAreActionableWithoutRetry(){assertTrue(ReceiptPresentation.errorLabel("user_action_required").contains("未授权"));assertTrue(ReceiptPresentation.errorLabel("desktop_dynamic_tool_unavailable").contains("不要重复发送"));assertTrue(ReceiptPresentation.errorLabel("upstream_timeout").contains("停止自动提交"))}
  @Test fun queuedCannotProveExecutionOrCompletion(){for(capture in listOf(false,true)){assertEquals(ReceiptPresentation.Evidence.QUEUED,ReceiptPresentation.evidence("upstream_queued",capture));assertEquals(ReceiptPresentation.Evidence.NONE,ReceiptPresentation.evidence("accepted",capture));assertEquals(ReceiptPresentation.Evidence.NONE,ReceiptPresentation.evidence("dispatching",capture))}}
  @Test fun completionLabelRequiresCaptureReceipt(){assertEquals(ReceiptPresentation.Evidence.FINAL_CAPTURED,ReceiptPresentation.evidence("codex_accepted",true));assertEquals(ReceiptPresentation.Evidence.EXECUTOR_ACCEPTED,ReceiptPresentation.evidence("codex_accepted",false));assertNotEquals(ReceiptPresentation.label("codex_accepted",true),ReceiptPresentation.label("codex_accepted",false));assertNull(ReceiptPresentation.hint("upstream_queued",false));assertNotNull(ReceiptPresentation.hint("upstream_queued",true))}
+ @Test fun steeringRequiresQueuedInputAndAnActiveTurn(){
+  assertTrue(canSteerPending("upstream_queued",null,true));assertTrue(canSteerPending("upstream_queued","steer_unavailable",true))
+  for(status in listOf("submitting","dispatching","unknown","steer_accepted","codex_accepted"))assertFalse(canSteerPending(status,null,true))
+  assertFalse(canSteerPending("upstream_queued","steer_in_progress",true));assertFalse(canSteerPending("upstream_queued",null,false))
+  assertEquals(ReceiptPresentation.Evidence.EXECUTOR_ACCEPTED,ReceiptPresentation.evidence("steer_accepted",true));assertTrue(composerSubmitted("steer_accepted"));assertTrue(SyncPolicy.acceptUpdate("upstream_queued","steer_accepted"));assertFalse(SyncPolicy.acceptUpdate("steer_accepted","upstream_queued"));assertTrue(SyncPolicy.acceptUpdate("steer_accepted","codex_accepted"))
+ }
 }

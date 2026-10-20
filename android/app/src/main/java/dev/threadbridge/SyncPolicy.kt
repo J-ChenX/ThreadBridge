@@ -6,7 +6,7 @@ object SyncPolicy {
  fun acceptUpdate(current:String,incoming:String):Boolean {
   if(current in terminal)return incoming==current
   if(current=="unknown")return incoming in terminal || incoming=="unknown"
-  val order=mapOf("submitting" to 0,"accepted" to 1,"dispatching" to 2,"upstream_queued" to 3)
+  val order=mapOf("submitting" to 0,"accepted" to 1,"dispatching" to 2,"upstream_queued" to 3,"steer_accepted" to 4)
   return incoming !in order || (order[incoming]?:0)>=(order[current]?:0)
  }
  fun retryDelay(attempt:Int):Long=1000L shl attempt.coerceIn(0,5)

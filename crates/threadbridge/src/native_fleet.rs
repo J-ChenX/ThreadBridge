@@ -208,7 +208,7 @@ fn remote_config(host: &Value) -> Result<String> {
         .0;
     Ok(format!("{folder}{split}remote.json"))
 }
-pub fn command(host: &Value) -> Result<String> {
+pub fn command(host: &Value, windows_input: Option<(&str, Option<&str>)>) -> Result<String> {
     ensure!(
         !string(host, "helper")?.ends_with(".py"),
         "native_helper_path_required"
@@ -223,7 +223,26 @@ pub fn command(host: &Value) -> Result<String> {
         !args.iter().any(|s| s.contains(['\0', '\r', '\n'])),
         "remote_command_invalid"
     );
-    match string(host,"platform")?{"linux"=>Ok(args.iter().map(|s|shell_quote(s)).collect::<Vec<_>>().join(" ")),"windows"=>Ok(encoded_ps(&format!("$ErrorActionPreference='Stop';$OutputEncoding=New-Object System.Text.UTF8Encoding($false);[Console]::OutputEncoding=$OutputEncoding;$p=[Console]::In.ReadToEnd();$p | & {};exit $LASTEXITCODE",args.iter().map(|s|ps_quote(s)).collect::<Vec<_>>().join(" ")))),_=>bail!("platform")}
+    match string(host, "platform")? {
+        "linux" => Ok(args
+            .iter()
+            .map(|s| shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" ")),
+        "windows" => {
+            let (input, cleanup) = windows_input.context("windows_rpc_input_required")?;
+            let cleanup = cleanup
+                .map(|path| {
+                    format!(
+                        "Remove-Item -Force -LiteralPath {} -ErrorAction SilentlyContinue",
+                        ps_quote(path)
+                    )
+                })
+                .unwrap_or_default();
+            Ok(encoded_ps(&format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$OutputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=$OutputEncoding;try{{$p={input};$p | & {}; $code=$LASTEXITCODE}}finally{{{cleanup}}};exit $code",args.iter().map(|s|ps_quote(s)).collect::<Vec<_>>().join(" "))))
+        }
+        _ => bail!("platform"),
+    }
 }
 fn ssh_command(host: &Value, cmd: &str) -> Result<Command> {
     ensure!(validate_ssh(string(host, "ssh")?), "tailnet_ssh_target");
@@ -270,7 +289,53 @@ pub fn ascii_json(value: &Value) -> Result<Vec<u8>> {
 pub async fn rpc(host: &Value, request: &Value, timeout: Duration) -> Result<Value> {
     let encoded = ascii_json(request)?;
     ensure!(encoded.len() <= MAX_REQUEST, "rpc_request_limit");
-    let raw = ssh(host, &command(host)?, &encoded, timeout).await?;
+    let raw = if host["platform"] == "windows" {
+        // Windows PowerShell can block on redirected Console.In under OpenSSH.
+        // Small metadata-only reads are encoded; message bodies and large input
+        // use a private temporary JSON file, avoiding command-line disclosure.
+        let metadata = matches!(
+            request["op"].as_str(),
+            Some("version" | "snapshot" | "baseline" | "policy" | "finalize" | "clear")
+        );
+        if metadata && encoded.len() <= 1024 {
+            let input = format!(
+                "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))",
+                STANDARD.encode(&encoded)
+            );
+            ssh(host, &command(host, Some((&input, None)))?, &[], timeout).await?
+        } else {
+            struct Temporary(std::path::PathBuf);
+            impl Drop for Temporary {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(&self.0);
+                }
+            }
+            let id = Uuid::new_v4();
+            let local = Temporary(std::env::temp_dir().join(format!("threadbridge-rpc-{id}.json")));
+            atomic(&local.0, &encoded)?;
+            let remote = format!(
+                "{}\\rpc-{id}.json",
+                string(host, "helper")?
+                    .rsplit_once('\\')
+                    .context("helper_parent")?
+                    .0
+            );
+            scp(host, &local.0, &remote).await?;
+            let input = format!(
+                "[IO.File]::ReadAllText({},[Text.Encoding]::UTF8)",
+                ps_quote(&remote)
+            );
+            ssh(
+                host,
+                &command(host, Some((&input, Some(&remote))))?,
+                &[],
+                timeout,
+            )
+            .await?
+        }
+    } else {
+        ssh(host, &command(host, None)?, &encoded, timeout).await?
+    };
     let response: Value = serde_json::from_slice(&raw)?;
     ensure!(response["schema"] == 1, "rpc_schema");
     Ok(response)
@@ -633,14 +698,23 @@ pub fn proxy_request(host: &Value, state: &Value, args: &[String]) -> Result<Val
     if args == ["--version"] {
         return Ok(json!({"op":"version"}));
     }
-    if args.len() == 2 && args[0] == "threadbridge-create" {
+    if args.len() == 2
+        && matches!(
+            args[0].as_str(),
+            "threadbridge-create" | "threadbridge-steer"
+        )
+    {
         ensure!(
             state["online"] == true
                 && native_remote::now() - state["last_success"].as_f64().unwrap_or(0.0) <= 10.0,
             "remote_not_fresh"
         );
         let mut request: Value = serde_json::from_str(&args[1])?;
-        ensure!(request["op"] == "create", "proxy_arguments");
+        ensure!(
+            (request["op"] == "create" && args[0] == "threadbridge-create")
+                || (request["op"] == "steer" && args[0] == "threadbridge-steer"),
+            "proxy_arguments"
+        );
         request["expected_version"] = host["verified_version"].clone();
         return Ok(request);
     }
@@ -677,14 +751,20 @@ pub async fn proxy(c: &Value, name: &str, config_path: &Path, args: &[String]) -
         &request,
         Duration::from_secs(if args == ["--version"] {
             4
-        } else if args.first().is_some_and(|a| a == "threadbridge-create") {
-            40
+        } else if args
+            .first()
+            .is_some_and(|a| matches!(a.as_str(), "threadbridge-create" | "threadbridge-steer"))
+        {
+            55
         } else {
             12
         }),
     )
     .await?;
-    if args.first().is_some_and(|a| a == "threadbridge-create") {
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.as_str(), "threadbridge-create" | "threadbridge-steer"))
+    {
         std::io::stdout().write_all(&serde_json::to_vec(&response)?)?;
     } else {
         std::io::stdout().write_all(string(&response, "stdout")?.as_bytes())?;
@@ -859,6 +939,7 @@ async fn scp(host: &Value, source: &Path, destination: &str) -> Result<()> {
         destination.to_owned()
     };
     let mut command = Command::new("scp");
+    command.arg("-C");
     command
         .args([
             "-o",
@@ -888,7 +969,7 @@ pub async fn deploy(c: &Value, names: &[String]) -> Result<()> {
         let id = Uuid::new_v4();
         let staging = std::env::temp_dir().join(format!("threadbridge-deploy-{id}.json"));
         atomic(&staging, &serde_json::to_vec(&remote)?)?;
-        let result=async{let parent=helper.rsplit_once(if host["platform"]=="windows"{'\\'}else{'/'}).context("helper_parent")?.0;let create=if host["platform"]=="windows"{encoded_ps(&format!("$ErrorActionPreference='Stop';New-Item -ItemType Directory -Force -Path {} | Out-Null",ps_quote(parent)))}else{format!("umask 077; mkdir -p -- {}",shell_quote(parent))};ssh(host,&create,&[],Duration::from_secs(20)).await?;let staged_binary=format!("{helper}.{id}.next");let staged_config=format!("{cfg}.{id}.next");scp(host,&binary,&staged_binary).await?;scp(host,&staging,&staged_config).await?;let apply=if host["platform"]=="windows"{encoded_ps(&format!("$ErrorActionPreference='Stop';Move-Item -Force -LiteralPath {} -Destination {};Move-Item -Force -LiteralPath {} -Destination {}",ps_quote(&staged_binary),ps_quote(helper),ps_quote(&staged_config),ps_quote(&cfg)))}else{format!("chmod 700 -- {b}; chmod 600 -- {c}; mv -f -- {b} {h}; mv -f -- {c} {d}",b=shell_quote(&staged_binary),c=shell_quote(&staged_config),h=shell_quote(helper),d=shell_quote(&cfg))};ssh(host,&apply,&[],Duration::from_secs(20)).await?;let response=rpc(host,&json!({"op":"version"}),Duration::from_secs(12)).await?;println!("{name}: installed; {}; queue={}",string(&response,"stdout")?.trim(),if host["verified_version"].as_str().is_some(){"verified"}else{"read-only"});Ok::<(),anyhow::Error>(())}.await;
+        let result=async{let parent=helper.rsplit_once(if host["platform"]=="windows"{'\\'}else{'/'}).context("helper_parent")?.0;let create=if host["platform"]=="windows"{encoded_ps(&format!("$ErrorActionPreference='Stop';New-Item -ItemType Directory -Force -Path {} | Out-Null",ps_quote(parent)))}else{format!("umask 077; mkdir -p -- {}",shell_quote(parent))};ssh(host,&create,&[],Duration::from_secs(20)).await?;let staged_binary=format!("{helper}.{id}.next");let staged_config=format!("{cfg}.{id}.next");scp(host,&binary,&staged_binary).await?;scp(host,&staging,&staged_config).await?;let apply=if host["platform"]=="windows"{encoded_ps(&format!("$ErrorActionPreference='Stop';Move-Item -Force -LiteralPath {} -Destination {};Move-Item -Force -LiteralPath {} -Destination {}",ps_quote(&staged_binary),ps_quote(helper),ps_quote(&staged_config),ps_quote(&cfg)))}else{format!("chmod 700 -- {b}; chmod 600 -- {c}; mv -f -- {b} {h}; mv -f -- {c} {d}",b=shell_quote(&staged_binary),c=shell_quote(&staged_config),h=shell_quote(helper),d=shell_quote(&cfg))};ssh(host,&apply,&[],Duration::from_secs(20)).await?;let response=rpc(host,&json!({"op":"version"}),Duration::from_secs(12)).await?;println!("{name}: installed; {}; queue={}",string(&response,"stdout")?.trim(),if host["verified_version"].as_str()==Some(string(&response,"stdout")?.trim()){"verified"}else{"read-only"});Ok::<(),anyhow::Error>(())}.await;
         let _ = fs::remove_file(staging);
         result?;
     }
@@ -1087,9 +1168,16 @@ mod tests {
         );
     }
     #[test]
-    fn windows_rpc_contains_only_fixed_native_args_and_stdin() {
+    fn windows_rpc_uses_fixed_native_args_and_removes_private_input_file() {
         let host = json!({"platform":"windows","helper":r"C:\Program Files\ThreadBridge\threadbridge.exe"});
-        let cmd = command(&host).unwrap();
+        let cmd = command(
+            &host,
+            Some((
+                "[IO.File]::ReadAllText('C:\\private\\request.json')",
+                Some("C:\\private\\request.json"),
+            )),
+        )
+        .unwrap();
         let raw = STANDARD
             .decode(cmd.split_whitespace().last().unwrap())
             .unwrap();
@@ -1100,7 +1188,9 @@ mod tests {
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect::<Vec<_>>();
         let ps = String::from_utf16(&utf16).unwrap();
-        assert!(ps.contains("[Console]::In.ReadToEnd()"));
+        assert!(!ps.contains("[Console]::In"));
+        assert!(ps.contains("[IO.File]::ReadAllText"));
+        assert!(ps.contains("finally{Remove-Item"));
         assert!(ps.contains(host["helper"].as_str().unwrap()));
         assert!(ps.contains("remote-capture"));
         assert!(!ps.contains("--message"));

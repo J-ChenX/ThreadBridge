@@ -15,6 +15,8 @@ use std::{path::Path, time::Duration};
 pub struct CreateSubmit {
     pub request_id: String,
     pub host_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_host_id: Option<String>,
     pub project: String,
     pub text: String,
     pub created_at: i64,
@@ -55,7 +57,16 @@ impl Store {
             "restore_read_only"
         );
         ensure!(tx.query_row("SELECT count(*)>0 FROM devices d JOIN creation_hosts ch ON ch.host=d.id WHERE d.id=?1 AND d.role='agent' AND d.revoked=0 AND d.expires>?2 AND d.last_seen>?3 AND ch.last_seen>?3",params![s.host_id,now(),now()-15],|r|r.get::<_,bool>(0))?,"host_offline");
-        ensure!(s.project.is_empty()||tx.query_row("SELECT EXISTS(SELECT 1 FROM thread_projects p JOIN threads t ON t.id=p.thread WHERE t.host=?1 AND p.project=?2) OR EXISTS(SELECT 1 FROM host_projects WHERE host=?1 AND project=?2)",params![s.host_id,s.project],|r|r.get::<_,bool>(0))?,"invalid_request");
+        let remote_owner = s
+            .display_host_id
+            .as_deref()
+            .filter(|owner| *owner != s.host_id);
+        let remote_name: Option<String> = if let Some(owner) = remote_owner {
+            Some(tx.query_row("SELECT name FROM desktop_project_catalog WHERE owner=?1 AND host=?2 AND path=?3",params![owner,s.host_id,s.project],|r|r.get(0)).optional()?.context("invalid_request")?)
+        } else {
+            None
+        };
+        ensure!(remote_owner.is_some()||s.project.is_empty()||tx.query_row("SELECT EXISTS(SELECT 1 FROM thread_projects p JOIN threads t ON t.id=p.thread WHERE t.host=?1 AND p.project=?2) OR EXISTS(SELECT 1 FROM host_projects WHERE host=?1 AND project=?2)",params![s.host_id,s.project],|r|r.get::<_,bool>(0))?,"invalid_request");
         ensure!(tx.query_row("SELECT count(*) FROM commands WHERE status IN ('accepted','dispatching','unknown','upstream_queued')",[],|r|r.get::<_,i64>(0))?<128,"queue_full");
         let cmd = Command {
             id: uuid::Uuid::new_v4().to_string(),
@@ -68,6 +79,12 @@ impl Store {
             expires_at: now() + 60,
         };
         tx.execute("INSERT INTO commands(id,device,request,digest,host,thread,payload,status,created,expires) VALUES(?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9)",params![cmd.id,device,s.request_id,digest,s.host_id,cmd.thread_id,serde_json::to_string(&cmd)?,now(),cmd.expires_at])?;
+        if let (Some(owner), Some(name)) = (remote_owner, remote_name) {
+            tx.execute(
+                "INSERT INTO creation_context VALUES(?1,?2,?3,?4)",
+                params![cmd.id, owner, s.project, name],
+            )?;
+        }
         tx.execute(
             "INSERT INTO events(kind,thread,created) VALUES('command',?1,?2)",
             params![cmd.thread_id, now()],
@@ -109,6 +126,7 @@ impl Store {
 
 /// Executes a single creation with inherited desktop permissions. No model turn is
 /// dispatched before the new native ID is saved in the local replica ledger.
+/// Only an existing desktop executor may own the turn after this proxy disconnects.
 pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> Result<Value> {
     let id = request["request_id"].as_str().context("invalid_request")?;
     uuid::Uuid::parse_str(id)?;
@@ -132,6 +150,8 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
     let mut db = rusqlite::Connection::open(database)?;
     db.busy_timeout(Duration::from_secs(3))?;
     db.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS phone_creations(request TEXT PRIMARY KEY,digest TEXT NOT NULL,native TEXT,status TEXT NOT NULL)")?;
+    // Keep legacy queue receipts immutable while retaining authoritative first-turn IDs.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS phone_creation_turns(request TEXT PRIMARY KEY,turn TEXT NOT NULL)")?;
     let digest = hash(&serde_json::to_string(request)?);
     if let Some((old, native, status)) = db
         .query_row(
@@ -149,14 +169,20 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
     {
         ensure!(digest == old, "idempotency_conflict");
         return Ok(
-            json!({"native_id":native,"status":if status=="upstream_queued"{status}else{"unknown".into()}}),
+            json!({"native_id":native,"status":if matches!(status.as_str(),"upstream_queued"|"dispatching"){status}else{"unknown".into()},
+                "native_turn_id":db.query_row("SELECT turn FROM phone_creation_turns WHERE request=?1",[id],|r|r.get::<_,String>(0)).optional()?}),
         );
     }
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS captured_project_catalog(project_path TEXT PRIMARY KEY)",
     )?;
     if !project.is_empty() {
-        ensure!(
+        // The authenticated Hub validates desktop-owned remote project mappings.
+        // They need not be registered as local projects on the execution host.
+        let desktop_authorized = request["desktop_owner"]
+            .as_str()
+            .is_some_and(|owner| uuid::Uuid::parse_str(owner).is_ok());
+        ensure!(desktop_authorized ||
             db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM captured_projects WHERE project_path=?1) OR EXISTS(SELECT 1 FROM captured_project_catalog WHERE project_path=?1)",
                 [project],
@@ -171,10 +197,11 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
     }
     let health = crate::health::read(database)?;
     ensure!(health["overflow"] == false, "capture_unavailable");
-    let mut adapter = match Adapter::connect_for_creation(
+    let mut adapter = match Adapter::connect_with_home(
         &config.codex,
-        version,
-        &config.codex_home,
+        None,
+        Some(version),
+        Some(&config.codex_home),
     )
     .await
     {
@@ -185,6 +212,7 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
             )
         }
     };
+    ensure!(adapter.allow_send, "queue_version_unverified");
     db.execute(
         "INSERT INTO phone_creations VALUES(?1,?2,NULL,'intent')",
         params![id, digest],
@@ -207,9 +235,8 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
         "UPDATE phone_creations SET native=?2 WHERE request=?1",
         params![id, native],
     )?;
-    // thread/start defers its rollout until a durable mutation. Queue reads
-    // the thread store from another process and cannot see an in-memory blank.
-    // Naming this new thread persists it without starting a model turn.
+    // Persist the blank thread before starting generation. Never queue its first
+    // message: an inactive desktop conversation may never consume that queue.
     let title: String = text
         .trim()
         .lines()
@@ -222,44 +249,47 @@ pub async fn create(config: &RemoteConfig, database: &Path, request: &Value) -> 
         .rpc("thread/name/set", json!({"threadId":native,"name":title}))
         .await
         .is_ok();
-    let output = if named {
-        native_remote::codex_output(
-            config,
-            &[
-                "queue".into(),
-                "--thread".into(),
-                native.into(),
-                format!("--message={text}"),
-            ],
-            Duration::from_secs(10),
-            4096,
-        )
-        .await
+    let turn = if named {
+        adapter
+            .rpc(
+                "turn/start",
+                json!({"threadId":native,"input":[{"type":"text","text":text}]}),
+            )
+            .await
+            .ok()
+            .and_then(|r| {
+                r["turn"]["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            })
     } else {
-        Err(anyhow::anyhow!("creation_persistence_unconfirmed"))
+        None
     };
-    // Once native identity is durable, an uncertain queue must still project it to the phone.
-    let queued = output
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .strip_prefix("Queued message ")
-        .and_then(|s| s.strip_suffix(&format!(" for thread {native}.")))
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .is_some();
-    let status = if queued { "upstream_queued" } else { "unknown" };
+    // Attempted mutations are never retried, including a lost turn/start acknowledgement.
+    let status = if turn.is_some() {
+        "dispatching"
+    } else {
+        "unknown"
+    };
     let tx = db.transaction()?;
     tx.execute(
         "UPDATE phone_creations SET status=?2 WHERE request=?1",
         params![id, status],
     )?;
+    if let Some(turn) = &turn {
+        tx.execute(
+            "INSERT INTO phone_creation_turns VALUES(?1,?2)",
+            params![id, turn],
+        )?;
+    }
     tx.execute_batch("CREATE TABLE IF NOT EXISTS captured_projects(thread_id TEXT PRIMARY KEY,project_path TEXT NOT NULL)")?;
     tx.execute(
         "INSERT OR REPLACE INTO captured_projects VALUES(?1,?2)",
         params![native, project],
     )?;
     tx.commit()?;
-    Ok(json!({"native_id":native,"status":status}))
+    Ok(json!({"native_id":native,"status":status,"native_turn_id":turn}))
 }
 
 pub async fn dispatch(
@@ -270,7 +300,16 @@ pub async fn dispatch(
     verified: &str,
     cmd: &Command,
 ) -> Result<()> {
-    let request = json!({"op":"create","request_id":cmd.id,"project":cmd.cursor.as_deref().unwrap_or(""),"text":cmd.text,"expected_version":verified});
+    let owner: Option<String> =
+        db.0.lock()
+            .unwrap()
+            .query_row(
+                "SELECT owner FROM creation_context WHERE command=?1",
+                [&cmd.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+    let request = json!({"op":"create","request_id":cmd.id,"project":cmd.cursor.as_deref().unwrap_or(""),"text":cmd.text,"expected_version":verified,"desktop_owner":owner});
     let result = if codex.file_name().is_some_and(|n| n == "codex-proxy") {
         let mut process = tokio::process::Command::new(codex);
         process.args(["threadbridge-create", &serde_json::to_string(&request)?]);
@@ -360,7 +399,7 @@ pub async fn dispatch(
         host,
         &cmd.id,
         result["status"].as_str().unwrap_or("unknown"),
-        None,
+        result["native_turn_id"].as_str(),
         None,
     )?;
     Ok(())
@@ -412,11 +451,11 @@ mod tests {
         let (dir, config, database, request) = fixture(true, false);
         let result = create(&config, &database, &request).await.unwrap();
         assert_eq!(result["native_id"], NATIVE);
-        assert_eq!(result["status"], "upstream_queued");
+        assert_eq!(result["status"], "dispatching");
         assert_eq!(create(&config, &database, &request).await.unwrap(), result);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "start\nname\nqueue\n"
+            "start\nname\nturn\n"
         );
         let mut changed = request.clone();
         changed["text"] = json!("different");
@@ -429,24 +468,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn missing_desktop_socket_uses_standalone_before_creation_once() {
-        let (dir, config, database, request) = fixture(true, false);
-        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"no_socket":true});
-        std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
-        let result = create(&config, &database, &request).await.unwrap();
-        assert_eq!(result["native_id"], NATIVE);
-        assert_eq!(result["status"], "upstream_queued");
-        assert_eq!(create(&config, &database, &request).await.unwrap(), result);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "start\nname\nqueue\n"
-        );
-    }
-    #[tokio::test]
     async fn unavailable_executor_rejects_before_any_creation_intent() {
         let (dir, config, database, request) = fixture(true, false);
-        let settings =
-            json!({"mode":"create","native_id":NATIVE,"no_socket":true,"fail_initialize":true});
+        let settings = json!({"mode":"create","native_id":NATIVE,"no_socket":true});
         std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
         let result = create(&config, &database, &request).await.unwrap();
         assert_eq!(result["status"], "rejected");
@@ -462,7 +486,26 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn lost_persistence_ack_preserves_identity_and_never_queues() {
+    async fn old_queued_creation_is_not_started_or_queued_again() {
+        let (dir, config, database, request) = fixture(true, false);
+        let c = rusqlite::Connection::open(&database).unwrap();
+        c.execute_batch("CREATE TABLE phone_creations(request TEXT PRIMARY KEY,digest TEXT NOT NULL,native TEXT,status TEXT NOT NULL)").unwrap();
+        c.execute(
+            "INSERT INTO phone_creations VALUES(?1,?2,?3,'upstream_queued')",
+            params![
+                request["request_id"].as_str().unwrap(),
+                hash(&serde_json::to_string(&request).unwrap()),
+                NATIVE
+            ],
+        )
+        .unwrap();
+        let result = create(&config, &database, &request).await.unwrap();
+        assert_eq!(result["status"], "upstream_queued");
+        assert!(result["native_turn_id"].is_null());
+        assert!(!dir.path().join("calls").exists());
+    }
+    #[tokio::test]
+    async fn lost_persistence_ack_preserves_identity_and_never_starts_turn() {
         let (dir, config, database, request) = fixture(true, false);
         let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"lose_name":true});
         std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
@@ -476,9 +519,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn missing_socket_and_lost_start_ack_never_create_again() {
+    async fn lost_start_ack_never_creates_again() {
         let (dir, config, database, request) = fixture(true, true);
-        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"no_socket":true,"lose_start":true});
+        let settings = json!({"mode":"create","native_id":NATIVE,"reply":true,"lose_start":true});
         std::fs::write(dir.path().join("fixture.json"), settings.to_string()).unwrap();
         assert!(create(&config, &database, &request).await.is_err());
         assert_eq!(
@@ -491,7 +534,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn lost_creation_or_queue_ack_is_never_retried() {
+    async fn lost_creation_or_turn_ack_is_never_retried() {
         for (reply, lose_start) in [(false, false), (true, true)] {
             let (dir, config, database, request) = fixture(reply, lose_start);
             let first = create(&config, &database, &request).await;
@@ -509,18 +552,18 @@ mod tests {
                 if lose_start {
                     "start\n"
                 } else {
-                    "start\nname\nqueue\n"
+                    "start\nname\nturn\n"
                 }
             );
         }
     }
     #[tokio::test]
-    async fn queue_execution_error_preserves_native_identity_without_retry() {
+    async fn turn_execution_error_preserves_native_identity_without_retry() {
         let (dir, config, database, request) = fixture(true, false);
         let mut settings: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("fixture.json")).unwrap())
                 .unwrap();
-        settings["queue_error"] = json!(true);
+        settings["turn_error"] = json!(true);
         std::fs::write(
             dir.path().join("fixture.json"),
             serde_json::to_vec(&settings).unwrap(),
@@ -532,7 +575,7 @@ mod tests {
         assert_eq!(create(&config, &database, &request).await.unwrap(), result);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("calls")).unwrap(),
-            "start\nname\nqueue\n"
+            "start\nname\nturn\n"
         );
     }
     #[tokio::test]
@@ -567,6 +610,7 @@ mod tests {
         let s = CreateSubmit {
             request_id: uuid::Uuid::new_v4().to_string(),
             host_id: host.clone(),
+            display_host_id: None,
             project: String::new(),
             text: "new human text".into(),
             created_at: now(),
@@ -649,12 +693,111 @@ mod tests {
         let submit = CreateSubmit {
             request_id: uuid::Uuid::new_v4().to_string(),
             host_id: host,
+            display_host_id: None,
             project: dir.path().to_str().unwrap().into(),
             text: "first in project".into(),
             created_at: now(),
         };
         assert!(db.submit_new(&phone, &submit).is_ok());
     }
+    #[test]
+    fn remote_project_catalog_routes_to_executor_and_keeps_desktop_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(&dir.path().join("hub.sqlite")).unwrap();
+        let (owner, _) = db.credential("agent", "windows").unwrap();
+        let (executor, _) = db.credential("agent", "lerrem").unwrap();
+        let (phone, _) = db.credential("phone", "fixture").unwrap();
+        db.heartbeat(&executor).unwrap();
+        crate::desktop_projects::replace(
+            &db,
+            &owner,
+            crate::desktop_projects::Metadata {
+                projects: vec![crate::desktop_projects::Project {
+                    host: executor.clone(),
+                    path: "/remote/only".into(),
+                    name: "Windows 远端项目".into(),
+                }],
+                assignments: vec![],
+            },
+        )
+        .unwrap();
+        db.0.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO creation_hosts VALUES(?1,?2)",
+                params![executor, now()],
+            )
+            .unwrap();
+        let hosts = db.hosts().unwrap();
+        let remote = hosts["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == owner)
+            .unwrap();
+        assert_eq!(remote["creation_projects"][0]["host_id"], executor);
+        assert_eq!(remote["creation_projects"][0]["path"], "/remote/only");
+        let mut request = CreateSubmit {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            host_id: executor.clone(),
+            display_host_id: Some(owner.clone()),
+            project: "/remote/only".into(),
+            text: "first".into(),
+            created_at: now(),
+        };
+        let receipt = db.submit_new(&phone, &request).unwrap();
+        assert_eq!(db.submit_new(&phone, &request).unwrap(), receipt);
+        assert!(db.claim_creation(&owner).unwrap().is_none());
+        let command = db.claim_creation(&executor).unwrap().unwrap();
+        assert_eq!(command.cursor.as_deref(), Some("/remote/only"));
+        let thread = key(&executor, NATIVE);
+        db.snapshot(
+            &executor,
+            &Snapshot {
+                thread: Thread {
+                    id: thread.clone(),
+                    native_id: NATIVE.into(),
+                    host_id: executor.clone(),
+                    title: "first".into(),
+                    status: "queue_ready".into(),
+                    revision: String::new(),
+                    updated_at: now(),
+                    can_send: true,
+                    history_cursor: None,
+                    project: String::new(),
+                },
+                messages: vec![],
+                initial: true,
+                history: false,
+            },
+        )
+        .unwrap();
+        db.0.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO creation_results VALUES(?1,?2)",
+                params![command.id, thread],
+            )
+            .unwrap();
+        let row = &db.threads(0).unwrap()["threads"][0];
+        assert_eq!(row["host_id"], executor);
+        assert_eq!(row["display_host_id"], owner);
+        assert_eq!(row["project"], "/remote/only");
+        assert_eq!(row["project_name"], "Windows 远端项目");
+        request.request_id = uuid::Uuid::new_v4().to_string();
+        request.project = "/not-registered".into();
+        assert_eq!(
+            db.submit_new(&phone, &request).unwrap_err().to_string(),
+            "invalid_request"
+        );
+        request.project = "/remote/only".into();
+        request.display_host_id = None;
+        assert_eq!(
+            db.submit_new(&phone, &request).unwrap_err().to_string(),
+            "invalid_request"
+        );
+    }
+
     #[test]
     fn search_matches_chinese_fragments_and_escapes_wildcards() {
         let dir = tempfile::tempdir().unwrap();

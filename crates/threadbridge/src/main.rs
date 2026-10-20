@@ -19,10 +19,12 @@ mod notify;
 #[cfg(unix)]
 mod probe;
 mod project_metadata;
+mod proxy_transport;
 mod questions;
 mod queue;
 mod replica_cleanup;
 mod rollout;
+mod steering;
 mod store;
 #[cfg(test)]
 mod tests;

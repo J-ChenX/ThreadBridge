@@ -25,6 +25,7 @@ class Repository(context:Context) {
  val dao=db.dao();val credentials=Credentials(context)
  internal val library=ConversationLibrary(context)
  internal val searchState=kotlinx.coroutines.flow.MutableStateFlow(ConversationSearchState())
+ internal val creationProjects=MutableStateFlow<List<NewConversationProject>>(emptyList())
  val redirects=kotlinx.coroutines.flow.MutableStateFlow<Map<String,String>>(emptyMap())
  internal val readState=ConversationReadState(context)
  private val imageCache=java.io.File(context.cacheDir,"conversation-images")
@@ -92,7 +93,7 @@ class Repository(context:Context) {
  }
  suspend fun pair(server:String,code:String,lan:Boolean){
   stopSession()
-  try {sessionGate.reset{val url=validateServer(server,lan);val r=request("/v1/pair",JSONObject().put("code",code.trim()).put("name","Android 主手机"),url,"");require(r.getInt("protocol")==1){"服务端协议版本不兼容"};withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();credentials.save(url,r.getString("token"),lan)}}
+  try {sessionGate.reset{val url=validateServer(server,lan);val r=request("/v1/pair",JSONObject().put("code",code.trim()).put("name","Android 主手机"),url,"");require(r.getInt("protocol")==1){"服务端协议版本不兼容"};withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();creationProjects.value=emptyList();draftPreview.clear();credentials.save(url,r.getString("token"),lan)}}
   finally { // reset has released its mutex and advanced the generation before workers start.
    foregroundScope?.takeIf{it.isActive}?.let{connect(it)}
   }
@@ -143,6 +144,8 @@ class Repository(context:Context) {
   val ha=hostResponse.getJSONArray("hosts")
   val hosts=(0 until ha.length()).map{val h=ha.getJSONObject(it);HostRow(h.getString("id"),h.getString("name"),h.getBoolean("online"))}
   val projects=mutableListOf<ProjectRow>();for(i in 0 until ha.length()){val h=ha.getJSONObject(i);val paths=h.optJSONArray("projects")?:continue;for(j in 0 until minOf(paths.length(),1000))projects+=ProjectRow(h.getString("id"),paths.getString(j),h.optJSONArray("project_details")?.let{a->(0 until a.length()).map{a.getJSONObject(it)}.find{it.optString("path")==paths.getString(j)}?.optString("name")}.orEmpty())}
+  val destinations=mutableListOf<NewConversationProject>()
+  for(i in 0 until ha.length()){val h=ha.getJSONObject(i);val a=h.optJSONArray("creation_projects")?:continue;for(j in 0 until minOf(a.length(),100)){val p=a.getJSONObject(j);val executor=p.getString("host_id");if(hosts.any{it.id==executor})destinations+=NewConversationProject(h.getString("id"),executor,p.getString("path"),p.optString("name",""))}}
   val rows=mutableListOf<ThreadRow>();var page=r;var count=0
   while(true){
    check(page.getString("collection_generation")==epoch){"同步已重置，请稍后重试"}
@@ -168,6 +171,7 @@ class Repository(context:Context) {
    dao.clearHosts();dao.putHosts(hosts);dao.clearProjects();dao.putProjects(projects);dao.putThreads(rows)
    dao.putSync(SyncState(cursor=if(changes.optBoolean("snapshot_required",false)||reset)r.getLong("cursor")else changes.optLong("cursor",previous),generation=epoch))
   }
+  creationProjects.value=destinations
   cleanupLocal()
   readState.observe(epoch,dao.allThreads())
   collection.value=epoch
@@ -232,8 +236,9 @@ class Repository(context:Context) {
  }
  private suspend fun submitNew(thread:ThreadRow,text:String):Pending{
   val id=UUID.randomUUID().toString();val payload=JSONObject().put("request_id",id).put("host_id",thread.hostId).put("project",thread.project).put("text",text).put("created_at",System.currentTimeMillis()/1000).put("kind","create")
+  if(thread.groupHostId!=thread.hostId)payload.put("display_host_id",thread.groupHostId)
   val pending=Pending(id,thread.id,payload.toString(),"submitting",null,null);dao.putPending(pending)
-  val result=try{val r=request("/v1/threads/create",payload);updatePending(pending.copy(status=r.getString("status"),commandId=r.getString("id")))}catch(e:ApiException){if(e.code in 400..499)updatePending(pending.copy(status="rejected",error=e.message))else pending}catch(e:Exception){if(e is CancellationException)throw e;pending}
+  val result=try{val r=request("/v1/threads/create",payload);updatePending(pending.copy(status=r.getString("status"),commandId=r.getString("id")))}catch(e:ApiException){if(e.code in 400..499)updatePending(pending.copy(status="rejected",error=e.reason))else pending}catch(e:Exception){if(e is CancellationException)throw e;pending}
   if(composerSubmitted(result.status))dao.clearDraftIfMatches(thread.id,text)
   return result
  }
@@ -251,8 +256,10 @@ class Repository(context:Context) {
   }catch(e:Exception){if(e is CancellationException)throw e;searchState.value=ConversationSearchState(local,offline=true)}
  }
  suspend fun restoreSearchedThread(thread:ThreadRow)=sessionGate.run{library.restore(thread.id);dao.putThreads(listOf(thread));readState.markRead(thread)}
- suspend fun createBlank(host:HostRow,project:String):String=sessionGate.run{
-  val id="local-"+UUID.randomUUID();dao.putThreads(listOf(ThreadRow(id,"新对话",host.id,"idle","",System.currentTimeMillis()/1000,true,host.online,null,project=project,localOnly=true,projectName=dao.projectName(host.id,project).orEmpty(),projectKnown=true)));id
+ internal suspend fun createBlank(host:HostRow,destination:NewConversationProject):String=sessionGate.run{
+  val project=destination.path
+  check(host.id==destination.hostId){"项目执行设备不匹配"}
+  val id="local-"+UUID.randomUUID();dao.putThreads(listOf(ThreadRow(id,"新对话",host.id,"idle","",System.currentTimeMillis()/1000,true,host.online,null,project=project,localOnly=true,projectName=destination.name.ifBlank{dao.projectName(host.id,project).orEmpty()},projectKnown=true,displayHostId=destination.ownerId)));id
  }
  private suspend fun cleanupLocal(){
   val now=System.currentTimeMillis();if(!library.cleanupDue(now))return
@@ -260,6 +267,12 @@ class Repository(context:Context) {
   for(thread in dao.allThreads())if(canExpire(thread,now,protected,draftPreview.get(thread.id,sessionGate.current())?:dao.draft(thread.id)?.text,thread.id in pending,selected)){
    db.withTransaction{deleteCachedThread(thread.id)};if(!thread.localOnly)library.expire(thread)
   };library.cleaned(now)
+ }
+ internal suspend fun steerPending(p:Pending)=sessionGate.run{
+  val current=dao.pendingById(p.requestId)?:return@run
+  check(current.status=="upstream_queued"){"这条消息已不在排队状态，请同步查看。"}
+  val r=try{request("/v1/commands/${current.commandId?:current.requestId}/steer",JSONObject())}catch(e:ApiException){throw IllegalStateException(ReceiptPresentation.errorLabel(e.reason))}
+  updatePending(current.copy(status=r.getString("status"),commandId=r.getString("id"),error=if(r.isNull("error"))null else r.getString("error")))
  }
  private suspend fun cancelInternal(p:Pending){check(dao.pendingById(p.requestId)!=null);val id=p.commandId?:return;val r=request("/v1/commands/$id/cancel",JSONObject());updatePending(p.copy(status=r.getString("status")))}
  private suspend fun retryPendingInternal(p:Pending){require(p.status=="submitting");check(dao.pendingById(p.requestId)!=null);try{val found=request("/v1/commands/${p.requestId}");updatePending(p.copy(status=found.getString("status"),commandId=found.getString("id")));return}catch(e:ApiException){if(e.code!=404)throw e}
@@ -370,5 +383,5 @@ class Repository(context:Context) {
  }
  private fun stopSession(){session?.cancel();session=null;socket?.cancel();socket=null}
  fun close(){stopSession();foregroundScope=null}
- suspend fun forget(){stopSession();sessionGate.reset{credentials.clear();readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();draftPreview.clear();withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply();httpHealthy=false;connectionIssue.value=null;connection.value="未连接"}}
+ suspend fun forget(){stopSession();sessionGate.reset{credentials.clear();readState.clear();library.clear();searchState.value=ConversationSearchState();redirects.value=emptyMap();creationProjects.value=emptyList();draftPreview.clear();withContext(Dispatchers.IO){db.clearAllTables();clearImageMemory();imageCache.deleteRecursively()};selected=null;captureWarning.value=null;capturePrefs.edit().clear().apply();httpHealthy=false;connectionIssue.value=null;connection.value="未连接"}}
 }

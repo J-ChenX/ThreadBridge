@@ -207,6 +207,52 @@ fn import_title(
         [&projection.id],
         |r| r.get(0),
     )?;
+    // Revisit only completed turns carrying evidence for unresolved sends. Older
+    // replies may already be imported when a client upgrades its reconciliation.
+    let recheck = {
+        let c = db.0.lock().unwrap();
+        let mut q=c.prepare("SELECT x.native_turn,json_extract(x.payload,'$.text'),s.started_at,q.queue_id IS NOT NULL FROM commands x JOIN capture_queue_ledger q ON q.id=x.id LEFT JOIN capture_queue_send_times s ON s.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.status IN ('dispatching','unknown','upstream_queued','steer_accepted') LIMIT 128")?;
+        let commands = q
+            .query_map(rusqlite::params![host, projection.id], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(q);
+        drop(c);
+        let mut turns = std::collections::BTreeSet::new();
+        for (turn, input, started, queued) in commands {
+            if let Some(turn) = turn {
+                turns.insert(turn);
+                continue;
+            }
+            if has_users {
+                if let (Some(input), Some(started)) = (input, started) {
+                    let mut q=source.prepare("SELECT DISTINCT turn_id FROM captured_user_messages WHERE thread_id=?1 AND created_at>=?2 AND (input_digest=?3 OR (?4 AND input_digest=?5)) LIMIT 17")?;
+                    let matched = q
+                        .query_map(
+                            rusqlite::params![
+                                native,
+                                started,
+                                hash(&input),
+                                queued,
+                                hash(&format!("{input}\n"))
+                            ],
+                            |r| r.get::<_, String>(0),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if matched.len() <= 16 {
+                        turns.extend(matched);
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&turns)?
+    };
     let sql = if has_title {
         "SELECT turn_id,reply,utf8_bytes,captured_at,title,rowid FROM captured_replies WHERE thread_id=?1 AND rowid>?2 ORDER BY rowid"
     } else {
@@ -217,12 +263,12 @@ fn import_title(
     } else {
         sql.to_owned()
     };
+    let sql = sql.replace(
+        "ORDER BY rowid",
+        "OR (thread_id=?1 AND turn_id IN (SELECT value FROM json_each(?4))) ORDER BY rowid",
+    );
     let mut query = source.prepare(&sql)?;
-    let mut rows = if has_users {
-        query.query(rusqlite::params![native, last_row, user_position])?
-    } else {
-        query.query(rusqlite::params![native, last_row])?
-    };
+    let mut rows = query.query(rusqlite::params![native, last_row, user_position, recheck])?;
     let mut imported = 0;
     while let Some(row) = rows.next()? {
         let turn: String = row.get(0)?;
@@ -294,11 +340,30 @@ fn import_title(
         let prior: Option<String> = source
             .query_row(prior_sql, rusqlite::params![native, row_id], |r| r.get(0))
             .optional()?;
+        // Acknowledged first turns have an authoritative identity; completion
+        // correlation does not depend on optional human-input capture.
+        let authoritative = {
+            let c = db.0.lock().unwrap();
+            let mut q=c.prepare("SELECT x.id FROM commands x JOIN capture_queue_ledger q ON q.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.native_turn=?3 AND x.status IN ('dispatching','unknown','steer_accepted') AND q.status IN ('dispatching','unknown','steer_accepted')")?;
+            let ids = q
+                .query_map(rusqlite::params![host, key(host, native), turn], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        for id in authoritative {
+            db.receipt(host, &id, "codex_accepted", Some(&turn), None)?;
+            db.0.lock().unwrap().execute(
+                "UPDATE capture_queue_ledger SET status='codex_accepted' WHERE id=?1",
+                [id],
+            )?;
+        }
         let mut eligible = Vec::new();
         if requests.len() <= 16 {
             let c = db.0.lock().unwrap();
             for request in requests {
-                let evidence:Option<(String,i64)>=c.query_row("SELECT json_extract(x.payload,'$.expected_revision'),x.created FROM commands x JOIN capture_queue_ledger q ON q.id=x.id WHERE x.id=?1 AND x.host=?2 AND x.thread=?3 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued')",rusqlite::params![request,host,key(host,native)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+                let evidence:Option<(String,i64)>=c.query_row("SELECT json_extract(x.payload,'$.expected_revision'),x.created FROM commands x JOIN capture_queue_ledger q ON q.id=x.id WHERE x.id=?1 AND x.host=?2 AND x.thread=?3 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued') AND x.native_turn IS NULL",rusqlite::params![request,host,key(host,native)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
                 if let Some((expected, created)) = evidence {
                     if prior.as_deref() == Some(&expected) && created <= captured {
                         eligible.push(request);
@@ -311,7 +376,7 @@ fn import_title(
             // Require one active command, the preceding revision, exact input
             // digest and a source input time after the durable send intent.
             let c = db.0.lock().unwrap();
-            let mut q = c.prepare("SELECT x.id,json_extract(x.payload,'$.expected_revision'),json_extract(x.payload,'$.text'),s.started_at,coalesce((SELECT cr.thread=x.thread FROM creation_results cr WHERE cr.command=x.id),0) AND json_extract(x.payload,'$.kind')='create' FROM commands x JOIN capture_queue_ledger q ON q.id=x.id LEFT JOIN capture_queue_send_times s ON s.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued')")?;
+            let mut q = c.prepare("SELECT x.id,json_extract(x.payload,'$.expected_revision'),json_extract(x.payload,'$.text'),s.started_at,q.queue_id IS NOT NULL FROM commands x JOIN capture_queue_ledger q ON q.id=x.id LEFT JOIN capture_queue_send_times s ON s.id=x.id WHERE x.host=?1 AND x.thread=?2 AND x.status IN ('dispatching','unknown','upstream_queued') AND q.status IN ('intent','unknown','upstream_queued') AND x.native_turn IS NULL")?;
             let active = q
                 .query_map(rusqlite::params![host, key(host, native)], |r| {
                     Ok((
@@ -323,12 +388,11 @@ fn import_title(
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if let [(request, Some(expected), Some(input), Some(created), created_native)] =
+            if let [(request, Some(expected), Some(input), Some(created), queued)] =
                 active.as_slice()
             {
-                let matches: bool = source.query_row("SELECT count(*)=1 FROM captured_user_messages WHERE thread_id=?1 AND turn_id=?2 AND input_digest=?3 AND created_at>=?4 AND created_at<=?5",rusqlite::params![native,turn,hash(input),created,captured.saturating_mul(1000).saturating_add(999)],|r|r.get(0))?;
-                if (prior.as_deref() == Some(expected)
-                    || (*created_native && expected.is_empty() && prior.is_none()))
+                let matches: bool = source.query_row("SELECT count(*)=1 FROM captured_user_messages WHERE thread_id=?1 AND turn_id=?2 AND (input_digest=?3 OR (?6 AND input_digest=?7)) AND created_at>=?4 AND created_at<=?5",rusqlite::params![native,turn,hash(input),created,captured.saturating_mul(1000).saturating_add(999),queued,hash(&format!("{input}\n"))],|r|r.get(0))?;
+                if (prior.as_deref() == Some(expected) || (expected.is_empty() && prior.is_none()))
                     && matches
                 {
                     eligible.push(request.clone());
@@ -881,8 +945,20 @@ pub async fn run(
             )?;
         }
     }
+    crate::steering::recover(&db, &host)?;
     loop {
         db.heartbeat(&host)?;
+        crate::steering::expire_unattempted(&db, &host)?;
+        if enabled {
+            crate::steering::dispatch_pending(
+                &db,
+                &source,
+                &codex,
+                &host,
+                verified.as_deref().unwrap_or(""),
+            )
+            .await?;
+        }
         if enabled && native.is_none() {
             db.0.lock().unwrap().execute("INSERT INTO creation_hosts VALUES(?1,?2) ON CONFLICT(host) DO UPDATE SET last_seen=excluded.last_seen",rusqlite::params![host,now()])?;
             if let Some(cmd) = db.claim_creation(&host)? {

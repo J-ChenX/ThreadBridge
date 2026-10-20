@@ -2,10 +2,7 @@ use crate::model::*;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout},
-};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
 pub enum SendError {
@@ -22,9 +19,7 @@ impl std::fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 pub struct Adapter {
-    child: Child,
-    input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    proxy: crate::proxy_transport::Proxy,
     next: u64,
     pub allow_send: bool,
     pub version: String,
@@ -43,23 +38,6 @@ impl Adapter {
         verified: Option<&str>,
         home: Option<&Path>,
     ) -> Result<Self> {
-        Self::connect_transport(codex, socket, verified, home, true).await
-    }
-    /// New threads can use a standalone server when no desktop control socket
-    /// exists. Fallback happens before thread/start; no creation is replayed.
-    pub async fn connect_for_creation(codex: &Path, verified: &str, home: &Path) -> Result<Self> {
-        match Self::connect_with_home(codex, None, Some(verified), Some(home)).await {
-            Ok(adapter) => Ok(adapter),
-            Err(_) => Self::connect_transport(codex, None, Some(verified), Some(home), false).await,
-        }
-    }
-    async fn connect_transport(
-        codex: &Path,
-        socket: Option<&Path>,
-        verified: Option<&str>,
-        home: Option<&Path>,
-        proxy: bool,
-    ) -> Result<Self> {
         let version = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::process::Command::new(codex)
@@ -70,36 +48,16 @@ impl Adapter {
         anyhow::ensure!(version.status.success(), "version check failed");
         let version = String::from_utf8(version.stdout)?.trim().to_string();
         let allow_send = verified.is_some_and(|v| v == version);
-        let mut cmd = tokio::process::Command::new(codex);
-        cmd.args(if proxy {
-            ["app-server", "proxy"]
-        } else {
-            ["app-server", "--stdio"]
-        });
-        if let Some(home) = home {
-            cmd.env("CODEX_HOME", home);
-        }
-        if let Some(socket) = socket {
-            cmd.arg("--sock").arg(socket);
-        }
-        let mut child = cmd
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
-        let input = child.stdin.take().unwrap();
-        let output = BufReader::new(child.stdout.take().unwrap());
+        let proxy = crate::proxy_transport::Proxy::connect(codex, socket, home).await?;
         let mut a = Self {
-            child,
-            input,
-            output,
+            proxy,
             next: 0,
             allow_send,
             version,
         };
         a.rpc("initialize",json!({"clientInfo":{"name":"threadbridge","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
-        a.input
+        a.proxy
+            .input
             .write_all(b"{\"method\":\"initialized\",\"params\":{}}\n")
             .await?;
         Ok(a)
@@ -109,10 +67,10 @@ impl Adapter {
         let id = self.next;
         let mut body = serde_json::to_vec(&json!({"id":id,"method":method,"params":params}))?;
         body.push(b'\n');
-        self.input.write_all(&body).await?;
+        self.proxy.input.write_all(&body).await?;
         for _ in 0..128 {
             let mut line = Vec::new();
-            let n = (&mut self.output)
+            let n = (&mut self.proxy.output)
                 .take((FRAME_LIMIT + 1) as u64)
                 .read_until(b'\n', &mut line)
                 .await?;
@@ -296,11 +254,6 @@ impl Adapter {
             .map(str::to_string)
             .context("missing_authoritative_turn_id")
             .map_err(SendError::Unknown)
-    }
-}
-impl Drop for Adapter {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
     }
 }
 

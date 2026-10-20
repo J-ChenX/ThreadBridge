@@ -849,6 +849,7 @@ pub async fn handle(config: &RemoteConfig, database: &Path, request: &Value) -> 
         Some("snapshot") => snapshot(config, database, request).await,
         Some("version") => Ok(json!({"schema":1,"stdout":format!("{}\n",version(config).await?)})),
         Some("queue") => dispatch(config, database, request).await,
+        Some("steer") => crate::steering::execute(config, database, request).await,
         Some("create") => crate::new_threads::create(config, database, request).await,
         Some(op @ ("baseline" | "policy" | "finalize" | "clear")) => reset(
             config,

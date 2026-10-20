@@ -42,6 +42,8 @@ def main():
             ('test_conversation_sync.py', []),
             ('test_thread_titles.py', []),
             ('test_capture_correlation.py', []),
+            ('test_queue_steer_receipts.py', []),
+            ('test_phone_steering.py', []),
             ('test_subagent_cleanup.py', []),
             ('test_capture_health_scope.py', []),
             ('test_capture_empty_reply.py', []),

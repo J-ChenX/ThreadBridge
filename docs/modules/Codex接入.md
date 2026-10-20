@@ -23,7 +23,7 @@ M04 将已完成轮次、用户输入与发送回执转换为 ThreadBridge 投�
 | 原 ID resume 候选 | `threadbridge resume` 在独立短期 grant/owner 租约下核验原 ID、cwd、revision、CLI 版本、sandbox 与审批后发送；不同于默认 queue 路线 |
 | Rust proxy Adapter | `adapter.rs` 仅连接已有 App Server，写能力需精确版本验证；默认控制 socket 是否可用由具体部署决定 |
 
-`doctor [--socket PATH] [--thread ID]` 委托已安装的 `codex app-server proxy --sock` 诊断已有控制端点，不启动 daemon。每 RPC 3 秒、256 KiB、32 通知预算；输出仅含状态与数量，不输出标题/正文/凭证。退出 0 表示只读探测通过，2 为接入失败，64 为参数错误；探测通过不代表 G01 完成。
+`doctor [--socket PATH] [--thread ID]` 委托已安装的 `codex app-server proxy --sock` 诊断已有公开端点，不启动 daemon。`proxy_transport.rs` 在 proxy 字节流上先完成 HTTP Upgrade 和 WebSocket 握手；旧 JSONL 端点仅在握手失败且尚未发送 RPC 时重新连接同一端点。模型请求发出后不切换协议或重放。每 RPC 3 秒、256 KiB、32 通知预算；输出仅含状态与数量，不输出标题/正文/凭证。退出 0 表示只读探测通过，2 为接入失败，64 为参数错误；探测通过不代表 G01 完成。
 
 ## 捕获、健康与关联
 
@@ -63,7 +63,13 @@ grant 必须显式绑定原 thread/host/cwd、CLI 版本、权限、工具兼容
 
 ## 项目与手机新建
 
-项目归属由原生已登记项目及根目录匹配线程 cwd，兼容 worktree；项目 ID、名称、根目录进入独立 `captured_projects`、`captured_project_names` 及 `captured_project_catalog` 副本表，不导入旧对话正文。无元数据的旧来源显示“项目待同步”。`new_threads.rs` 在已验证启用 queue 的设备侧执行 `thread/start`，继承桌面既有权限并以真实原 ID queue 第一条人类文字；持久意图先于创建，原 ID 落库先于 queue；桌面控制 socket 不存在时，仅在 thread/start 前改用独立 stdio app-server。新线程通过 thread/name/set 持久化后才调用 queue，避免只有内存 ID 时队列读不到 rollout。初始化两种连接均失败时明确拒绝，创建、命名或 queue 结果未知时不重试。原始 Codex 记录不因手机缓存清理而修改。手机接口与查询合同见 [通信与存储](通信与存储.md#项目与手机新建)。新建需要匹配版本的 Hub、bridge 和远端 helper，APK 安装不会升级电脑服务。
+项目归属由原生已登记项目及根目录匹配线程 cwd，兼容 worktree；项目 ID、名称、根目录进入独立 `captured_projects`、`captured_project_names` 及 `captured_project_catalog` 副本表，不导入旧对话正文。无元数据的旧来源显示“项目待同步”。
+
+`new_threads.rs` 在已验证启用发送的设备侧，通过已有公开 App Server 的 proxy 执行 `thread/start`，沿用该执行器的配置与权限；持久意图先于创建，原 ID 落库并通过 `thread/name/set` 持久化后，以人类原文调用 `turn/start`。首条消息不经过 queue，避免未激活的新对话长期不消费队列。记录真实 turn ID 后返回 dispatching；只有同 ID 的最终回复采集后才标为 codex_accepted，启动确认不代表完成。创建、命名或首轮启动结果未知时不重试；旧 queue 创建账本保持原状。没有可连接的公开端点时，在创建前明确拒绝；短命 stdio 进程不能承担首轮执行生命周期。
+
+新建目录同时提供桌面本机项目和该桌面登记的远端项目。例如 Windows 的 lerrem 项目保留 Windows 显示归属，执行设备仍为 lerrem。Hub 核对 owner/执行设备/路径三元组后持久保存创建上下文；设备核对实际绝对目录存在，不要求该远端目录同时注册为执行设备的本机项目。手机本地空白对话及原 ID 接管后均保留该路由。新建目录不依赖旧对话正文已缓存。原始 Codex 记录不因手机缓存清理而修改。手机接口与查询合同见 [通信与存储](通信与存储.md#项目与手机新建)。新建需要匹配版本的 Hub、bridge 和远端 helper，APK 安装不会升级电脑服务。
+
+手机引导只对当前公开执行器内已加载且 turn ID 精确匹配的活动任务生效。共享持久索引不代表同一执行器拥有桌面任务；公开 daemon 对桌面对话返回 `notLoaded` 时保持原队列，不启动新执行器或 resume。新建任务在公开 daemon 上可执行，也不表示其他桌面对话已能引导。
 
 ## 压缩记录与安装目录变化
 

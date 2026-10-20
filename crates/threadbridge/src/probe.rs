@@ -1,9 +1,8 @@
 use serde_json::{json, Value};
-use std::{path::Path, process::Stdio, time::Duration};
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    process::Command,
-};
+use std::{path::Path, time::Duration};
+#[cfg(test)]
+use tokio::io::BufReader;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_NOTIFICATIONS: usize = 32;
@@ -146,22 +145,12 @@ pub async fn probe(socket: &Path, thread: Option<&str>) -> Result<Value, String>
             "existing endpoint unavailable: socket does not exist; no daemon started".into(),
         );
     }
-    let mut child = Command::new("codex")
-        .args(["app-server", "proxy", "--sock"])
-        .arg(socket)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| "cannot launch installed codex proxy")?;
-    let mut input = child.stdin.take().ok_or("missing proxy input")?;
-    let mut output = BufReader::new(child.stdout.take().ok_or("missing proxy output")?);
-    let result = inspect(&mut output, &mut input, thread).await;
-    // This is only our short-lived proxy, never the upstream app-server.
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(TIMEOUT, child.wait()).await;
-    result
+    let mut proxy = crate::proxy_transport::Proxy::connect(Path::new("codex"), Some(socket), None)
+        .await
+        .map_err(|_| "cannot attach installed codex proxy")?;
+    let mut result = inspect(&mut proxy.output, &mut proxy.input, thread).await?;
+    result["transport"] = json!(proxy.transport);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -275,14 +264,15 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (read, mut write) = stream.into_split();
-            let mut reader = BufReader::new(read);
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut methods = Vec::new();
-            loop {
-                let mut text = String::new();
-                if reader.read_line(&mut text).await.unwrap() == 0 {
-                    break;
-                }
+            while let Some(message) = ws.next().await {
+                let message = message.unwrap();
+                let Message::Text(text) = message else {
+                    continue;
+                };
                 let request: Value = serde_json::from_str(&text).unwrap();
                 let method = request["method"].as_str().unwrap().to_string();
                 methods.push(method.clone());
@@ -294,9 +284,13 @@ mod tests {
                     "thread/loaded/list" => json!({"data":["fixture-task"]}),
                     _ => panic!("unexpected non-read operation"),
                 };
-                send(&mut write, json!({"id":request["id"],"result":result}))
-                    .await
-                    .unwrap();
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
                 if method == "thread/loaded/list" {
                     break;
                 }
@@ -306,6 +300,7 @@ mod tests {
         let result = probe(&path, Some("fixture-task")).await.unwrap();
         assert_eq!(result["target_loaded"], true);
         assert_eq!(result["writes_enabled"], false);
+        assert_eq!(result["transport"], "official_proxy_websocket");
         assert_eq!(server.await.unwrap().len(), 5);
     }
 }

@@ -43,6 +43,7 @@ pub const HUB_TABLES: &[&str] = &[
     "thread_projects",
     "thread_tasks",
     "creation_results",
+    "creation_context",
     "creation_hosts",
 ];
 pub fn suffix(path: &Path, extra: &str) -> PathBuf {

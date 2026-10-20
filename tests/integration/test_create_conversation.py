@@ -4,10 +4,10 @@ import hashlib,json,os,socket,sqlite3,subprocess,sys,tempfile,time,urllib.reques
 from pathlib import Path
 from test_conversation_sync import save_turn
 
-def main():
- binary=Path(sys.argv[1]).resolve();repo=Path(__file__).resolve().parents[2]
+def scenario(binary,ack):
+ repo=Path(__file__).resolve().parents[2]
  with tempfile.TemporaryDirectory(prefix='tb-create-') as tmp:
-  root=Path(tmp);db=root/'hub.sqlite';source=root/'capture.sqlite';fake=root/'codex';fake.symlink_to(repo/'tests/fixtures/mock_codex.py');native='00000000-0000-4000-8000-000000000001';root.joinpath('fixture.json').write_text(json.dumps({'mode':'create','native_id':native,'reply':False,'queue_error':True,'no_socket':True}))
+  root=Path(tmp);db=root/'hub.sqlite';source=root/'capture.sqlite';fake=root/'codex';fake.symlink_to(repo/'tests/fixtures/mock_codex.py');native='00000000-0000-4000-8000-000000000001';root.joinpath('fixture.json').write_text(json.dumps({'mode':'create','native_id':native,'reply':ack}))
   env={'PATH':'/usr/bin:/bin','HOME':str(root),'CODEX_HOME':str(root)}
   baseline='00000000-0000-4000-8000-000000000002';turn='00000000-0000-4000-8000-000000000003'
   event={'thread-id':baseline,'turn-id':turn,'type':'agent-turn-complete','last-assistant-message':'baseline','cwd':str(root)}
@@ -37,21 +37,32 @@ def main():
    worker=bridge();wait(lambda:api('/v1/threads')['threads'])
    payload={'request_id':str(uuid.uuid4()),'host_id':'host','project':str(root),'text':'phone starts here','created_at':int(time.time())}
    command=api('/v1/threads/create',payload);assert api('/v1/threads/create',payload)['id']==command['id']
-   receipt=wait(lambda:(lambda r:r if r['status']=='unknown' else None)(api('/v1/commands/'+command['id'])))
-   tid=hashlib.sha256(('host\0default\0'+native).encode()).hexdigest();assert receipt['result_thread_id']==tid
+   # dispatching also covers the local claim, before a native thread exists.
+   receipt=wait(lambda:(lambda r:r if r['status']==('dispatching' if ack else 'unknown') and r.get('result_thread_id') and (not ack or r.get('native_turn_id')) else None)(api('/v1/commands/'+command['id'])))
+   tid=hashlib.sha256(('host\0default\0'+native).encode()).hexdigest();assert receipt['result_thread_id']==tid, receipt
+   assert receipt['native_turn_id']==('00000000-0000-4000-8000-000000000009' if ack else None)
    row=next(r for r in api('/v1/threads')['threads'] if r['id']==tid);assert row['native_id']==native and row['project']==str(root)
-   assert root.joinpath('calls').read_text()=='start\nname\nqueue\n'
+   assert root.joinpath('calls').read_text()=='start\nname\nturn\n'
    final_turn='00000000-0000-4000-8000-000000000009';stamp=int(time.time()*1000)+1
+   if ack:
+    # An unrelated captured turn must not settle an acknowledged first turn.
+    unrelated={'thread-id':native,'turn-id':str(uuid.uuid4()),'type':'agent-turn-complete','last-assistant-message':'unrelated','cwd':str(root)}
+    subprocess.run([binary,'capture','--thread',native,'--database',source,json.dumps(unrelated)],check=True,stdout=subprocess.DEVNULL,env=env)
+    time.sleep(2.2)
+    assert api('/v1/commands/'+command['id'])['status']=='dispatching'
    save_turn(source,native,final_turn,[('new-human','phone starts here',stamp,hashlib.sha256(b'phone starts here').hexdigest())],stamp+1)
    completed={'thread-id':native,'turn-id':final_turn,'type':'agent-turn-complete','last-assistant-message':'first created reply','cwd':str(root)}
    subprocess.run([binary,'capture','--thread',native,'--database',source,'--title','phone starts here',json.dumps(completed)],check=True,stdout=subprocess.DEVNULL,env=env)
    wait(lambda:api('/v1/commands/'+command['id'])['status']=='codex_accepted')
-   assert [m['role'] for m in reversed(api('/v1/threads/'+tid+'/messages')['messages'])]==['user','assistant']
+   assert [m['role'] for m in reversed(api('/v1/threads/'+tid+'/messages')['messages'])]==(['assistant','user','assistant'] if ack else ['user','assistant'])
    worker.terminate();worker.wait(timeout=3);worker=bridge();time.sleep(2.2)
-   assert root.joinpath('calls').read_text()=='start\nname\nqueue\n';assert api('/v1/commands/'+payload['request_id'])['result_thread_id']==tid
+   assert root.joinpath('calls').read_text()=='start\nname\nturn\n';assert api('/v1/commands/'+payload['request_id'])['result_thread_id']==tid
    assert api('/v1/threads?q=phone%20here')['threads'][0]['id']==tid
-   print('PASS real Hub -> durable creation -> bridge -> isolated mock thread/start and queue; project, native ID adoption after queue execution error, search, first-turn completion and restart no resend')
+   print('PASS real Hub -> durable creation -> existing executor turn/start; '+('authoritative turn completion' if ack else 'lost turn acknowledgement')+'; native identity, search and restart no resend')
   finally:
    if worker:worker.terminate();worker.wait(timeout=3)
    hub.terminate();hub.wait(timeout=3)
+def main():
+ binary=Path(sys.argv[1]).resolve()
+ for ack in (True,False):scenario(binary,ack)
 if __name__=='__main__':main()

@@ -82,3 +82,9 @@ qa_android_ui016_boundaries.py 验证跨项目及跨设备时主页/侧边栏固
 远程桌面项目：`desktop_projects::tests` 覆盖服务器项目为空时使用发起端明确归属、执行主机映射隔离、项目改名/删除、多桌面冲突、状态损坏保留、重复同步幂等及正文/原 ID/消息活动/请求不变；`desktop_project_changes_are_sent_even_without_body_changes` 验证没有正文变化和数据库下载时，新项目与名称变化仍进入真实 snapshot RPC。`test_desktop_projects.py` 使用固定合成 SSH 响应和真实 fleet/Hub/手机 HTTP 接口，验证正文快照未变化时的分类、改名、旧 helper 缺字段时保留、明确移除、原执行身份与消息活动不变；不登录真实主机，不提交命令。
 
 `python3 tests/android/qa_android_images_status.py` 使用专用模拟器、实际 debug APK 和临时合成 HTTP 服务检查图片首次读取、同步阻塞时内存命中、进程重启后磁盘命中、点击空白关闭、精确原图下载、运行/完成/离线状态、具体健康告警及恢复；同时记录小屏深色大字号、关闭动画、横屏和平板截图。不会连接生产服务或提交命令。
+
+`test_create_conversation.py` 通过真实 Hub/bridge 与隔离 CLI 验证创建、命名和 `turn/start` 首轮直发，检查真实 turn ID、无关完成轮次不能结算、丢失启动回执后保留原 ID、原文关联及重启不重发。Rust 新建回归验证无桌面 socket 提前拒绝、旧 queue 账本不重放、远端项目目录及 owner/执行设备/路径校验；`NewConversationProjectsTest` 验证无缓存对话的远端项目可选、不同设备同路径不合并及名称优先级。
+
+`test_queue_steer_receipts.py` 验证首轮电脑引导追加一个 LF 后的旧回执修复，包括已导入最终回复的重新核对；没有 queue ID、错误 revision、重复输入及额外空白均不结算。`test_phone_steering.py` 通过真实 Hub/bridge 和固定 CLI fixture 验证手机显式引导、同一队列项删除、同一 active turn 接受、最终回复前恢复发送、真实 turn 完成、未知回执和重启不重发。Rust steering 模块覆盖来源校验、空闲/错误轮次/队列被修改时不操作、删除/引导回执丢失、幂等及未开始请求过期；JVM 检查按钮可用条件、回执证据及单向状态更新。`qa_android_steering.py` 只在专用模拟器使用自有 debug 合成数据，验证真实按钮、深色大字体、下一条草稿、发送按钮恢复、最终回复和重启；不操作正式应用或真实上游任务。
+
+传输回归包含 WebSocket 消息边界、漂亮格式 JSON、超限/二进制拒绝和旧 JSONL 兼容。`cargo test --workspace --locked installed_proxy_attaches_to_isolated_control_fixture -- --ignored` 用已安装官方 proxy 连接隔离 WebSocket fixture，只执行只读请求，不启动 daemon 或模型任务。真实执行验收须另行区分新建任务所在公开执行器与桌面原任务归属，fixture 通过不能代替此验证。

@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS thread_projects(thread TEXT PRIMARY KEY,project TEXT 
 CREATE TABLE IF NOT EXISTS creation_results(command TEXT PRIMARY KEY,thread TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS project_names(host TEXT NOT NULL,project TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(host,project));
 CREATE TABLE IF NOT EXISTS host_projects(host TEXT NOT NULL,project TEXT NOT NULL,PRIMARY KEY(host,project));
+CREATE TABLE IF NOT EXISTS steering_intents(command TEXT PRIMARY KEY,status TEXT NOT NULL,turn TEXT NOT NULL,error TEXT,created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS creation_context(command TEXT PRIMARY KEY,owner TEXT NOT NULL,project TEXT NOT NULL,project_name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS creation_hosts(host TEXT PRIMARY KEY,last_seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS thread_message_state(thread TEXT PRIMARY KEY,revision INTEGER NOT NULL,activity_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS completion_metadata(thread TEXT NOT NULL,turn TEXT NOT NULL,title TEXT NOT NULL,recorded_at INTEGER NOT NULL,PRIMARY KEY(thread,turn));
@@ -277,6 +279,13 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
                 projects.pop();
                 details.pop();
             }
+            let mut destinations = c.prepare("SELECT p.host,p.path,p.name,d.name FROM desktop_project_catalog p JOIN devices d ON d.id=p.host WHERE p.owner=?1 AND d.role='agent' AND d.revoked=0 ORDER BY d.name,p.path LIMIT 100")?
+                .query_map([id], |r|Ok(json!({"host_id":r.get::<_,String>(0)?,"path":r.get::<_,String>(1)?,"name":r.get::<_,String>(2)?,"host_name":r.get::<_,String>(3)?})))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            while serde_json::to_vec(&destinations)?.len() > 128 * 1024 {
+                destinations.pop();
+            }
+            row["creation_projects"] = json!(destinations);
             row["project_details"] = json!(details);
             row["projects"] = json!(projects);
         }
@@ -442,7 +451,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             .collect::<Vec<_>>();
         let searching = !needle.is_empty();
         let c = self.0.lock().unwrap();
-        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0),coalesce(dp.path,p.project,''),coalesce(dp.name,pn.name,''),(dp.path IS NOT NULL OR p.thread IS NOT NULL),coalesce(ts.turn_id,''),coalesce(ts.status,'unknown'),coalesce((SELECT min(o.owner) FROM desktop_thread_origins o WHERE o.host=t.host AND o.native=t.native HAVING count(DISTINCT o.owner)=1),t.host) FROM threads t LEFT JOIN thread_tasks ts ON ts.thread=t.id LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id LEFT JOIN resolved_desktop_projects dp ON dp.host=t.host AND dp.native=t.native LEFT JOIN thread_projects p ON p.thread=t.id LEFT JOIN project_names pn ON pn.host=t.host AND pn.project=p.project ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT ?2 OFFSET ?1")?;
+        let mut q=c.prepare("SELECT t.id,t.native,t.host,t.title,t.status,t.revision,t.updated,CASE WHEN t.status='resume_ready' THEN t.can_send AND EXISTS(SELECT 1 FROM resume_owners ro WHERE ro.thread=t.id AND ro.expires>strftime('%s','now') AND ro.last_seen>strftime('%s','now')-15) AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) WHEN EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id) THEN t.can_send AND EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.thread=t.id AND ct.queue_enabled=1 AND ct.last_seen>strftime('%s','now')-15) ELSE t.can_send AND NOT EXISTS(SELECT 1 FROM capture_targets ct WHERE ct.host=t.host) END,t.cursor,CASE WHEN d.revoked=0 AND d.expires>strftime('%s','now') THEN COALESCE(d.last_seen,0) ELSE 0 END,coalesce(ms.revision,0),coalesce(ms.activity_at,0),coalesce(dp.path,cc.project,p.project,''),coalesce(dp.name,cc.project_name,pn.name,''),(dp.path IS NOT NULL OR cc.project IS NOT NULL OR p.thread IS NOT NULL),coalesce(ts.turn_id,''),coalesce(ts.status,'unknown'),coalesce((SELECT min(o.owner) FROM desktop_thread_origins o WHERE o.host=t.host AND o.native=t.native HAVING count(DISTINCT o.owner)=1),cc.owner,t.host) FROM threads t LEFT JOIN creation_results cr ON cr.thread=t.id LEFT JOIN creation_context cc ON cc.command=cr.command LEFT JOIN thread_tasks ts ON ts.thread=t.id LEFT JOIN devices d ON d.id=t.host LEFT JOIN thread_message_state ms ON ms.thread=t.id LEFT JOIN resolved_desktop_projects dp ON dp.host=t.host AND dp.native=t.native LEFT JOIN thread_projects p ON p.thread=t.id LEFT JOIN project_names pn ON pn.host=t.host AND pn.project=p.project ORDER BY max(t.updated*1000,coalesce(ms.activity_at,0)) DESC,t.id LIMIT ?2 OFFSET ?1")?;
         // Stream title matching in Rust: SQLite's lower() only folds ASCII.
         // Search never imports message bodies, and follows the same bounded catalogue as sync.
         let mut iter = q.query(params![
@@ -670,16 +679,17 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             "unknown",
             "history_loaded",
             "upstream_queued",
+            "dispatching",
         ]
         .contains(&status)
-            || status == "codex_accepted" && turn.is_none()
+            || matches!(status, "codex_accepted" | "dispatching") && turn.is_none()
         {
             bail!("invalid_receipt")
         }
         let mut c = self.0.lock().unwrap();
         let tx = c.transaction()?;
-        tx.execute("INSERT INTO events(kind,thread,created) SELECT 'command',thread,?3 FROM commands WHERE id=?1 AND host=?2 AND status IN ('dispatching','unknown','upstream_queued') AND (status<>?4 OR native_turn IS NOT ?5 OR error IS NOT ?6)",params![id,host,now(),status,turn,error])?;
-        tx.execute("UPDATE commands SET status=?3,native_turn=?4,error=?5 WHERE id=?1 AND host=?2 AND status IN ('dispatching','unknown','upstream_queued')",params![id,host,status,turn,error])?;
+        tx.execute("INSERT INTO events(kind,thread,created) SELECT 'command',thread,?3 FROM commands WHERE id=?1 AND host=?2 AND status IN ('dispatching','unknown','upstream_queued','steer_accepted') AND (status<>'steer_accepted' OR ?4='codex_accepted') AND (status<>?4 OR native_turn IS NOT ?5 OR error IS NOT ?6)",params![id,host,now(),status,turn,error])?;
+        tx.execute("UPDATE commands SET status=?3,native_turn=?4,error=?5 WHERE id=?1 AND host=?2 AND status IN ('dispatching','unknown','upstream_queued','steer_accepted') AND (status<>'steer_accepted' OR ?3='codex_accepted')",params![id,host,status,turn,error])?;
         tx.commit()?;
         Ok(())
     }
@@ -766,6 +776,7 @@ CREATE TABLE IF NOT EXISTS agent_ledger(id TEXT PRIMARY KEY,status TEXT NOT NULL
             tx.execute(&format!("DELETE FROM {table} WHERE thread=?1"), [thread])?;
         }
         tx.execute("DELETE FROM threads WHERE id=?1", [thread])?;
+        tx.execute("DELETE FROM creation_context WHERE command IN (SELECT id FROM commands WHERE thread=?1)",[thread])?;
         // Keep the native routing identity solely for source exclusion propagation.
         tx.execute(
             "UPDATE capture_targets SET queue_enabled=0,last_seen=0 WHERE thread=?1",
